@@ -1,5 +1,6 @@
 import { Installation } from "@/installation"
 import { Provider } from "@/provider/provider"
+import { ACPProviderMeta } from "@/acp/provider-meta"
 import { Log } from "@/util/log"
 import {
   streamText,
@@ -59,9 +60,12 @@ export namespace LLM {
     })
     const cfg = Config.get()
 
-    // In reaslab-agent, model resolution comes from meta at runtime
-    const language = input.meta
-      ? Provider.fromMeta(input.meta)
+    // In reaslab-agent, model resolution comes from meta at runtime.
+    // Meta can be passed explicitly in StreamInput, or looked up from
+    // ACPProviderMeta (populated by ACP server before SessionPrompt.prompt()).
+    const meta = input.meta ?? ACPProviderMeta()[input.sessionID]
+    const language = meta
+      ? Provider.fromMeta(meta)
       : Provider.fromMeta({
           model: input.model.id,
           baseUrl: "http://localhost:8080",
