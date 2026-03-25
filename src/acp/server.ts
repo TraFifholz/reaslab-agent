@@ -3,13 +3,17 @@
 
 import { ACP } from "./protocol"
 import { writeACP, readStdin } from "./stdio"
-import { Provider, type ProviderMeta } from "../provider/provider"
-import { Agent } from "../agent/agent"
-import { streamText, stepCountIs, type ToolSet } from "ai"
+import type { ProviderMeta } from "../provider/provider"
 import { Boot } from "../boot"
 import { MCP } from "../mcp"
 import { Instance } from "../project/instance"
-import { buildBuiltinTools, decodeToolOutput } from "./builtin-tools"
+import { decodeToolOutput } from "./builtin-tools"
+import { Session } from "../session"
+import { SessionPrompt } from "../session/prompt"
+import { MessageV2 } from "../session/message-v2"
+import { Bus } from "../bus"
+import { ACPProviderMeta } from "./provider-meta"
+import type { SessionID } from "../session/schema"
 
 const PROTOCOL_VERSION = "0.1.0"
 
@@ -17,7 +21,6 @@ interface SessionState {
   id: string
   workspace: string
   mcpServers: MCPServerConfig[]
-  meta: Record<string, unknown>
   abortController?: AbortController
 }
 
@@ -35,44 +38,11 @@ export interface JsonRpcRequest {
   params?: Record<string, unknown>
 }
 
-/** Callback interface for routing processor events to ACP notifications */
-export interface ProcessorCallbacks {
-  onTextDelta: (sessionId: string, text: string) => void
-  onThinkingDelta: (sessionId: string, text: string) => void
-  onToolCall: (sessionId: string, toolCallId: string, name: string, input: Record<string, unknown>) => void
-  onToolResult: (sessionId: string, toolCallId: string, status: "completed" | "failed", output: unknown) => void
-}
-
 export class ACPServer {
   private sessions = new Map<string, SessionState>()
-  private sessionCounter = 0
 
   /** Optional hook for tests to capture notifications */
   onNotification?: (msg: unknown) => void
-
-  /** Create ACP callbacks wired to writeACP */
-  createCallbacks(workspace: string): ProcessorCallbacks {
-    const self = this
-    return {
-      onTextDelta(sessionId: string, text: string) {
-        const msg = ACP.messageChunk(sessionId, text)
-        self._notify(msg)
-      },
-      onThinkingDelta(sessionId: string, text: string) {
-        const msg = ACP.thoughtChunk(sessionId, text)
-        self._notify(msg)
-      },
-      onToolCall(sessionId: string, toolCallId: string, name: string, input: Record<string, unknown>) {
-        const msg = ACP.toolCall(sessionId, toolCallId, name, input, workspace)
-        self._notify(msg)
-      },
-      onToolResult(sessionId: string, toolCallId: string, status: "completed" | "failed", output: unknown) {
-        const { output: rawOutput, diff } = decodeToolOutput(output)
-        const msg = ACP.toolCallUpdate(sessionId, toolCallId, status, rawOutput, diff)
-        self._notify(msg)
-      },
-    }
-  }
 
   private _notify(msg: unknown) {
     if (this.onNotification) {
@@ -92,13 +62,13 @@ export class ACPServer {
         case "authenticate":
           return ACP.response(id!, this.handleAuthenticate())
         case "session/new":
-          return ACP.response(id!, this.handleSessionNew(params || {}))
+          return ACP.response(id!, await this.handleSessionNew(params || {}))
         case "session/load":
-          return ACP.response(id!, this.handleSessionLoad(params || {}))
+          return ACP.response(id!, await this.handleSessionLoad(params || {}))
         case "session/prompt":
           return ACP.response(id!, await this.handleSessionPrompt(params || {}, id!))
         case "session/cancel":
-          return ACP.response(id!, this.handleSessionCancel(params || {}))
+          return ACP.response(id!, await this.handleSessionCancel(params || {}))
         default:
           return ACP.error(id ?? null, -32601, `Method not found: ${method}`)
       }
@@ -130,60 +100,56 @@ export class ACPServer {
     return { authenticated: true }
   }
 
-  private handleSessionNew(params: Record<string, unknown>) {
-    this.sessionCounter++
-    const sessionId = `session-${this.sessionCounter}-${Date.now()}`
-
+  private async handleSessionNew(params: Record<string, unknown>) {
+    const workspace = (params.cwd as string) || "/workspace"
+    await Boot.init(workspace)
+    const sessionInfo = await Instance.provide({
+      directory: workspace,
+      fn: () => Session.createNext({ directory: workspace }),
+    })
     const session: SessionState = {
-      id: sessionId,
-      workspace: (params.cwd as string) || "/workspace",
+      id: sessionInfo.id,
+      workspace,
       mcpServers: (params.mcpServers as MCPServerConfig[]) || [],
-      meta: {},
     }
-
-    this.sessions.set(sessionId, session)
-
-    return {
-      sessionId,
-      workspace: session.workspace,
-    }
+    this.sessions.set(session.id, session)
+    return { sessionId: session.id, workspace: session.workspace }
   }
 
-  private handleSessionLoad(params: Record<string, unknown>) {
+  private async handleSessionLoad(params: Record<string, unknown>) {
     const sessionId = params.sessionId as string
-    if (!sessionId) {
-      throw new Error("sessionId is required")
-    }
+    if (!sessionId) throw new Error("sessionId is required")
 
-    const session = this.sessions.get(sessionId)
+    let session = this.sessions.get(sessionId)
     if (!session) {
-      throw new Error(`Session not found: ${sessionId}`)
+      const workspace = (params.cwd as string) || "/workspace"
+      await Boot.init(workspace)
+      const dbSession = await Instance.provide({
+        directory: workspace,
+        fn: () => Session.get(sessionId as SessionID),
+      })
+      session = {
+        id: dbSession.id,
+        workspace: dbSession.directory,
+        mcpServers: [],
+      }
+      this.sessions.set(session.id, session)
     }
 
-    // reaslab re-sends cwd and mcpServers on session/load (agent switch) — update them
     if (params.cwd) session.workspace = params.cwd as string
     if (params.mcpServers) session.mcpServers = params.mcpServers as MCPServerConfig[]
-
-    return {
-      sessionId: session.id,
-      workspace: session.workspace,
-    }
+    return { sessionId: session.id, workspace: session.workspace }
   }
 
   private async handleSessionPrompt(params: Record<string, unknown>, requestId: string | number): Promise<null> {
     const sessionId = params.sessionId as string
     const session = this.sessions.get(sessionId)
-    if (!session) {
-      throw new Error(`Session not found: ${sessionId}`)
-    }
+    if (!session) throw new Error(`Session not found: ${sessionId}`)
 
     const meta = (params._meta || params.meta || {}) as Record<string, unknown>
     const prompt = params.prompt as string | unknown[]
+    const parts = this.parsePromptToInputParts(prompt)
 
-    // Parse prompt content types
-    const userMessage = this.parsePromptContent(prompt)
-
-    // Extract provider meta
     const providerMeta: ProviderMeta = {
       model: (meta.model as string) || "",
       baseUrl: (meta.baseUrl as string) || "",
@@ -191,175 +157,128 @@ export class ACPServer {
       reasoningEffort: meta.reasoningEffort as string | undefined,
       maxTokens: meta.maxTokens as number | undefined,
     }
+    if (!providerMeta.model || !providerMeta.baseUrl || !providerMeta.apiKey) {
+      throw new Error("_meta must include model, baseUrl, and apiKey")
+    }
 
-    // Create abort controller for this task
     const abortController = new AbortController()
     session.abortController = abortController
 
-    // Spawn async — don't await
-    // TODO: Wire to actual session processor in Task 13
-    this.executeAgentLoop(sessionId, userMessage, providerMeta, session, abortController.signal)
-      .then(() => {
-        this._notify(ACP.response(requestId, { stopReason: "end_turn" }))
-      })
+    this.executeAgentLoop(session, parts, providerMeta, requestId)
       .catch((err) => {
         console.error(`[acp] agent loop error for ${sessionId}:`, err)
-        // Surface the error as a visible message before sending stopReason
         this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${err.message}]\n`))
         this._notify(ACP.response(requestId, { stopReason: "error", error: err.message }))
       })
-      .finally(() => {
-        session.abortController = undefined
-      })
+      .finally(() => { session.abortController = undefined })
 
-    // Respond immediately with null (async processing)
     return null
   }
 
-  private handleSessionCancel(params: Record<string, unknown>) {
+  private async handleSessionCancel(params: Record<string, unknown>) {
     const sessionId = params.sessionId as string
     const session = this.sessions.get(sessionId)
-    if (!session) {
-      throw new Error(`Session not found: ${sessionId}`)
-    }
-
+    if (!session) throw new Error(`Session not found: ${sessionId}`)
     if (session.abortController) {
       session.abortController.abort()
       session.abortController = undefined
     }
-
+    await SessionPrompt.cancel(sessionId as SessionID)
     return { cancelled: true }
   }
 
   // --- Prompt parsing ---
 
-  /** Parse ACP prompt content types into a user message */
-  parsePromptContent(prompt: string | unknown[]): UserMessage {
-    if (typeof prompt === "string") {
-      return { role: "user", parts: [{ type: "text", text: prompt }] }
-    }
-
-    if (!Array.isArray(prompt)) {
-      return { role: "user", parts: [{ type: "text", text: String(prompt) }] }
-    }
-
-    const parts: MessagePart[] = prompt.map((block: any) => {
+  parsePromptToInputParts(prompt: string | unknown[]): Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }> {
+    if (typeof prompt === "string") return [{ type: "text", text: prompt }]
+    if (!Array.isArray(prompt)) return [{ type: "text", text: String(prompt) }]
+    return prompt.map((block: any) => {
       if (block.type === "text") return { type: "text" as const, text: block.text }
       if (block.type === "resource") return { type: "text" as const, text: block.resource?.text || "" }
-      if (block.type === "resource_link") return { type: "file" as const, uri: block.uri, name: block.name }
+      if (block.type === "resource_link") return { type: "file" as const, url: block.uri, filename: block.name || block.uri, mime: block.mimeType || "text/plain" }
       return { type: "text" as const, text: JSON.stringify(block) }
     })
-
-    return { role: "user", parts }
   }
 
   // --- Agent loop ---
 
   private async executeAgentLoop(
-    sessionId: string,
-    userMessage: UserMessage,
-    providerMeta: ProviderMeta,
     session: SessionState,
-    signal: AbortSignal,
+    parts: Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }>,
+    providerMeta: ProviderMeta,
+    requestId: string | number,
   ): Promise<void> {
     await Boot.init(session.workspace)
 
     await Instance.provide({
       directory: session.workspace,
-      fn: () => this._runAgentLoop(sessionId, userMessage, providerMeta, session, signal),
-    })
-  }
-
-  private async _runAgentLoop(
-    sessionId: string,
-    userMessage: UserMessage,
-    providerMeta: ProviderMeta,
-    session: SessionState,
-    signal: AbortSignal,
-  ): Promise<void> {
-    // Connect MCP servers if provided
-    if (session.mcpServers.length > 0) {
-      const serverMap: Record<string, { url: string; headers?: Record<string, string> }> = {}
-      for (const srv of session.mcpServers) {
-        const headers: Record<string, string> = {}
-        for (const h of srv.headers || []) {
-          headers[h.name] = h.value
+      fn: async () => {
+        if (session.mcpServers.length > 0) {
+          const serverMap: Record<string, { url: string; headers?: Record<string, string> }> = {}
+          for (const srv of session.mcpServers) {
+            const headers: Record<string, string> = {}
+            for (const h of srv.headers || []) { headers[h.name] = h.value }
+            serverMap[srv.name] = { url: srv.url, headers }
+          }
+          await MCP.connectFromACP(serverMap).catch((err: any) => {
+            console.error("[acp] MCP connection error:", err.message)
+          })
         }
-        serverMap[srv.name] = { url: srv.url, headers }
-      }
-      await MCP.connectFromACP(serverMap).catch((err: any) => {
-        console.error("[acp] MCP connection error:", err.message)
-      })
-    }
 
-    const callbacks = this.createCallbacks(session.workspace)
+        ACPProviderMeta()[session.id] = providerMeta
 
-    // Get the language model from meta
-    const language = Provider.fromMeta(providerMeta)
+        const sessionId = session.id
+        const partTypes = new Map<string, string>()
 
-    // Get agent definition
-    const agent = await Agent.get("build")
+        const unsubPartUpdated = Bus.subscribe(MessageV2.Event.PartUpdated, (event) => {
+          const part = event.properties.part
+          if (part.sessionID !== sessionId) return
+          switch (part.type) {
+            case "text":
+              partTypes.set(part.id, "text")
+              break
+            case "reasoning":
+              partTypes.set(part.id, "reasoning")
+              break
+            case "tool": {
+              if (part.state.status === "running") {
+                this._notify(ACP.toolCall(sessionId, part.callID, part.tool, (part.state.input ?? {}) as Record<string, unknown>, session.workspace))
+              } else if (part.state.status === "completed") {
+                const { output: rawOutput, diff } = decodeToolOutput(part.state.output)
+                this._notify(ACP.toolCallUpdate(sessionId, part.callID, "completed", rawOutput, diff))
+              } else if (part.state.status === "error") {
+                this._notify(ACP.toolCallUpdate(sessionId, part.callID, "failed", part.state.error))
+              }
+              break
+            }
+          }
+        })
 
-    // Build user message text
-    const userText = userMessage.parts
-      .map((p) => (p.type === "text" ? p.text : `[File: ${p.name}]`))
-      .filter(Boolean)
-      .join("\n")
+        const unsubPartDelta = Bus.subscribe(MessageV2.Event.PartDelta, (event) => {
+          const { sessionID, partID, delta } = event.properties
+          if (sessionID !== sessionId) return
+          const partType = partTypes.get(partID)
+          if (partType === "text") this._notify(ACP.messageChunk(sessionId, delta))
+          else if (partType === "reasoning") this._notify(ACP.thoughtChunk(sessionId, delta))
+        })
 
-    // Get tools from MCP and built-ins, merge them
-    const [mcpTools, builtinTools] = await Promise.all([
-      MCP.tools().catch(() => ({} as ToolSet)),
-      buildBuiltinTools(signal, session.workspace),
-    ])
-    const allTools: ToolSet = { ...builtinTools, ...mcpTools }
-
-    // Build system prompt
-    const systemParts: string[] = []
-    if (agent.prompt) systemParts.push(agent.prompt)
-    systemParts.push(`You are working in the project root directory. The absolute path is ${session.workspace}, but always refer to files using relative paths (e.g. "README.md", "src/main.rs") — never use the full absolute path in your responses.`)
-    systemParts.push(`Current date: ${new Date().toISOString().split("T")[0]}`)
-
-    // Stream with Vercel AI SDK
-    const result = streamText({
-      model: language,
-      system: systemParts.join("\n\n"),
-      messages: [{ role: "user", content: userText }],
-      tools: allTools,
-      stopWhen: stepCountIs(50),
-      abortSignal: signal,
+        try {
+          await SessionPrompt.prompt({
+            sessionID: sessionId as SessionID,
+            model: { providerID: "reaslab" as any, modelID: (providerMeta.model || "unknown") as any },
+            agent: "build",
+            parts,
+          })
+        } finally {
+          unsubPartUpdated()
+          unsubPartDelta()
+          partTypes.clear()
+          delete ACPProviderMeta()[session.id]
+        }
+      },
     })
 
-    // Process stream events and emit ACP notifications
-    for await (const event of result.fullStream) {
-      signal.throwIfAborted()
-
-      switch (event.type) {
-        case "text-delta":
-          callbacks.onTextDelta(sessionId, (event as any).delta ?? (event as any).text ?? "")
-          break
-
-        case "reasoning-delta":
-          callbacks.onThinkingDelta(sessionId, (event as any).delta ?? "")
-          break
-
-        case "tool-call":
-          callbacks.onToolCall(sessionId, event.toolCallId, event.toolName, (event.input ?? {}) as Record<string, unknown>)
-          break
-
-        case "tool-result":
-          callbacks.onToolResult(sessionId, event.toolCallId, "completed", event.output)
-          break
-
-        case "tool-error":
-          callbacks.onToolResult(sessionId, event.toolCallId, "failed", String(event.error))
-          break
-
-        case "error":
-          console.error("[acp] stream error:", event.error)
-          callbacks.onTextDelta(sessionId, `\n[Error: ${(event.error as any)?.message ?? String(event.error)}]\n`)
-          break
-      }
-    }
+    this._notify(ACP.response(requestId, { stopReason: "end_turn" }))
   }
 
   // --- Main loop ---
@@ -389,18 +308,4 @@ export class ACPServer {
 
     console.error("[reaslab-agent] stdin closed, shutting down")
   }
-}
-
-// --- Types ---
-
-interface MessagePart {
-  type: "text" | "file"
-  text?: string
-  uri?: string
-  name?: string
-}
-
-interface UserMessage {
-  role: "user"
-  parts: MessagePart[]
 }
