@@ -189,6 +189,7 @@ export class ACPServer {
 
   // --- Prompt parsing ---
 
+  /** Parse ACP prompt content blocks into SessionPrompt input parts */
   parsePromptToInputParts(prompt: string | unknown[]): Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }> {
     if (typeof prompt === "string") return [{ type: "text", text: prompt }]
     if (!Array.isArray(prompt)) return [{ type: "text", text: String(prompt) }]
