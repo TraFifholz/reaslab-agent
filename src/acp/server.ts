@@ -157,6 +157,10 @@ export class ACPServer {
       throw new Error(`Session not found: ${sessionId}`)
     }
 
+    // reaslab re-sends cwd and mcpServers on session/load (agent switch) — update them
+    if (params.cwd) session.workspace = params.cwd as string
+    if (params.mcpServers) session.mcpServers = params.mcpServers as MCPServerConfig[]
+
     return {
       sessionId: session.id,
       workspace: session.workspace,

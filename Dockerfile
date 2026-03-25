@@ -4,7 +4,7 @@ RUN apk add --no-cache git ripgrep
 
 WORKDIR /app
 
-COPY package.json bun.lockb ./
+COPY package.json bun.lock tsconfig.json ./
 RUN bun install --production --frozen-lockfile
 
 COPY src/ ./src/
