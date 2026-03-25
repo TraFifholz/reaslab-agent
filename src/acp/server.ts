@@ -8,6 +8,7 @@ import { Agent } from "../agent/agent"
 import { streamText, type ToolSet } from "ai"
 import { Boot } from "../boot"
 import { MCP } from "../mcp"
+import { Instance } from "../project/instance"
 
 const PROTOCOL_VERSION = "0.1.0"
 
@@ -259,6 +260,19 @@ export class ACPServer {
   ): Promise<void> {
     await Boot.init(session.workspace)
 
+    await Instance.provide({
+      directory: session.workspace,
+      fn: () => this._runAgentLoop(sessionId, userMessage, providerMeta, session, signal),
+    })
+  }
+
+  private async _runAgentLoop(
+    sessionId: string,
+    userMessage: UserMessage,
+    providerMeta: ProviderMeta,
+    session: SessionState,
+    signal: AbortSignal,
+  ): Promise<void> {
     // Connect MCP servers if provided
     if (session.mcpServers.length > 0) {
       const serverMap: Record<string, { url: string; headers?: Record<string, string> }> = {}

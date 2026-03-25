@@ -9,6 +9,7 @@ RUN bun install --production --frozen-lockfile
 
 COPY src/ ./src/
 COPY skills/ ./skills/
+COPY migration/ ./migration/
 COPY drizzle.config.ts ./
 
 # Create data directory for SQLite
