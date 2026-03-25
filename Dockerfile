@@ -1,0 +1,17 @@
+FROM oven/bun:1-alpine
+
+RUN apk add --no-cache git ripgrep
+
+WORKDIR /app
+
+COPY package.json bun.lockb ./
+RUN bun install --production --frozen-lockfile
+
+COPY src/ ./src/
+COPY skills/ ./skills/
+COPY drizzle.config.ts ./
+
+# Create data directory for SQLite
+RUN mkdir -p /app/data
+
+CMD ["bun", "run", "src/index.ts"]
