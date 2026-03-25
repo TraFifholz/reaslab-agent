@@ -209,7 +209,6 @@ export namespace Agent {
         // Override with config values if provided
         if (agentDef.systemPrompt) existing.prompt = agentDef.systemPrompt
         if (agentDef.maxSteps) existing.steps = agentDef.maxSteps
-        if (agentDef.name) existing.name = agentDef.name
       }
     }
 

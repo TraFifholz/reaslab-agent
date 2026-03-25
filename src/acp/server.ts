@@ -167,6 +167,10 @@ export class ACPServer {
     this.executeAgentLoop(session, parts, providerMeta, requestId)
       .catch((err) => {
         console.error(`[acp] agent loop error for ${sessionId}:`, err)
+        if (err instanceof Session.BusyError) {
+          this._notify(ACP.error(requestId, -32603, `Session is busy: ${sessionId}`))
+          return
+        }
         this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${err.message}]\n`))
         this._notify(ACP.response(requestId, { stopReason: "error", error: err.message }))
       })
@@ -183,7 +187,11 @@ export class ACPServer {
       session.abortController.abort()
       session.abortController = undefined
     }
-    await SessionPrompt.cancel(sessionId as SessionID)
+    await Boot.init(session.workspace)
+    await Instance.provide({
+      directory: session.workspace,
+      fn: () => SessionPrompt.cancel(sessionId as SessionID),
+    })
     return { cancelled: true }
   }
 

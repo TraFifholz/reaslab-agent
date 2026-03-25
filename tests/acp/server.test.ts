@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test"
 import { ACPServer } from "../../src/acp/server"
+import { Session } from "../../src/session"
 
 describe("ACPServer", () => {
   test("handles initialize", async () => {
@@ -128,23 +129,69 @@ describe("ACPServer", () => {
     expect(result.result.cancelled).toBe(true)
   })
 
-  test("parsePromptContent handles string", () => {
+  test("parsePromptToInputParts handles string", () => {
     const server = new ACPServer()
-    const msg = server.parsePromptContent("hello")
-    expect(msg.role).toBe("user")
-    expect(msg.parts[0]).toEqual({ type: "text", text: "hello" })
+    const parts = server.parsePromptToInputParts("hello")
+    expect(parts).toEqual([{ type: "text", text: "hello" }])
   })
 
-  test("parsePromptContent handles array with mixed types", () => {
+  test("parsePromptToInputParts handles array with mixed types", () => {
     const server = new ACPServer()
-    const msg = server.parsePromptContent([
+    const parts = server.parsePromptToInputParts([
       { type: "text", text: "hello" },
       { type: "resource", resource: { text: "file content" } },
-      { type: "resource_link", uri: "file:///test.ts", name: "test.ts" },
+      { type: "resource_link", uri: "file:///test.ts", name: "test.ts", mimeType: "text/typescript" },
     ])
-    expect(msg.parts).toHaveLength(3)
-    expect(msg.parts[0]).toEqual({ type: "text", text: "hello" })
-    expect(msg.parts[1]).toEqual({ type: "text", text: "file content" })
-    expect(msg.parts[2]).toEqual({ type: "file", uri: "file:///test.ts", name: "test.ts" })
+    expect(parts).toHaveLength(3)
+    expect(parts[0]).toEqual({ type: "text", text: "hello" })
+    expect(parts[1]).toEqual({ type: "text", text: "file content" })
+    expect(parts[2]).toEqual({
+      type: "file",
+      url: "file:///test.ts",
+      filename: "test.ts",
+      mime: "text/typescript",
+    })
+  })
+
+  test("session/prompt sends ACP error notification when session is busy", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "/workspace" },
+    })
+
+    ;(server as any).executeAgentLoop = () =>
+      Promise.reject(new Session.BusyError(sess.result.sessionId))
+
+    const result = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "2",
+      method: "session/prompt",
+      params: {
+        sessionId: sess.result.sessionId,
+        prompt: "Hello!",
+        _meta: {
+          model: "test-model",
+          baseUrl: "http://localhost",
+          apiKey: "test-key",
+        },
+      },
+    })
+
+    expect(result.result).toBeNull()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(notifications).toContainEqual({
+      jsonrpc: "2.0",
+      id: "2",
+      error: {
+        code: -32603,
+        message: `Session is busy: ${sess.result.sessionId}`,
+      },
+    })
   })
 })
