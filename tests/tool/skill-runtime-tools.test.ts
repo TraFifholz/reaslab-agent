@@ -192,6 +192,36 @@ describe("runtime skill tools", () => {
     expectNotFound(hiddenByDefault.result)
   })
 
+  test("skill-finder includeHidden still respects denied-path filtering", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+    const localPath = await writeSkillFile(root, "denied-hidden-skill", "hidden denied skill", "Hidden denied body")
+
+    await expect(
+      loadSkill(
+        root,
+        {
+          localPath,
+          workspaceID,
+          sessionID,
+        },
+        async () => {
+          throw new Error("User denied local skill path access")
+        },
+      ),
+    ).rejects.toThrow(/user denied local skill path access|permission denied|denied/i)
+
+    const call = await findSkill(root, {
+      query: "denied-hidden-skill",
+      includeHidden: true,
+      scope: "session",
+      workspaceID,
+      sessionID,
+    })
+
+    expectNotFound(call.result)
+  })
+
   test("load-skill uses session scope by default for a local skill", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
     tempDirs.push(root)
@@ -241,6 +271,37 @@ describe("runtime skill tools", () => {
     })
 
     expectFound(workspaceResult.result, "shared-discovered")
+  })
+
+  test("unload-skill requests mutation permission before hiding", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+    await writeSkillFile(root, "permission-hidden", "permission hidden skill", "Permission body")
+
+    await expect(
+      executeRuntimeTool({
+        directory: root,
+        toolID: "unload-skill",
+        args: {
+          name: "permission-hidden",
+          scope: "session",
+          workspaceID,
+          sessionID,
+        },
+        async ask() {
+          throw new Error("User denied skill hide")
+        },
+      }),
+    ).rejects.toThrow(/user denied skill hide|permission denied|denied/i)
+
+    const stillVisible = await findSkill(root, {
+      query: "permission-hidden",
+      scope: "session",
+      workspaceID,
+      sessionID,
+    })
+
+    expectFound(stillVisible.result, "permission-hidden")
   })
 
   test("load-skill blocks a workspace-scoped mutation when permission is denied", async () => {
@@ -353,5 +414,22 @@ describe("runtime skill tools", () => {
     })
 
     expect(call.result.metadata?.status).toBe("command_conflict")
+  })
+
+  test("load-skill reports a skill conflict for a colliding discovered skill name", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+    await writeSkillFile(root, "shared-skill", "discovered shared skill", "Discovered body")
+
+    const localRoot = path.join(root, "local")
+    const localPath = await writeSkillFile(localRoot, "shared-skill", "local shared skill", "Local body")
+
+    const call = await loadSkill(root, {
+      localPath,
+      workspaceID,
+      sessionID,
+    })
+
+    expect(call.result.metadata?.status).toBe("skill_conflict")
   })
 })

@@ -12,6 +12,7 @@ import { makeRunPromise } from "@/effect/run-service"
 import { Flag } from "@/flag/flag"
 import { Global } from "@/global"
 import { Permission } from "@/permission"
+import { Instance } from "@/project/instance"
 import type { SessionID } from "@/session/schema"
 import { Filesystem } from "@/util/filesystem"
 import { Config } from "../config/config"
@@ -80,6 +81,7 @@ export namespace Skill {
   type RuntimeLoadInput = RuntimeScope & {
     scope: RuntimeScopeName
     root: string
+    file?: string
     hide?: string[]
   }
 
@@ -100,9 +102,16 @@ export namespace Skill {
   export type RuntimeOverlay = {
     load(input: RuntimeLoadInput): Promise<void>
     unload(input: RuntimeUnloadInput): Promise<void>
-    all(scope?: RuntimeScope): Promise<Info[]>
-    get(name: string, scope?: RuntimeScope): Promise<Info | undefined>
+    all(scope?: RuntimeScope, opts?: { includeHidden?: boolean }): Promise<Info[]>
+    get(name: string, scope?: RuntimeScope, opts?: { includeHidden?: boolean }): Promise<Info | undefined>
   }
+
+  type ParsedInfoOptions = {
+    invalid?: "throw" | "ignore"
+    log?: boolean
+  }
+
+  const runtimeState = Instance.state(() => runtimeOverlay())
 
   const add = async (state: State, match: string) => {
     const md = await ConfigMarkdown.parse(match).catch(async (err: any) => {
@@ -152,16 +161,36 @@ export namespace Skill {
       })
   }
 
-  const parseRuntimeInfo = async (location: string) => {
+  export const parseRuntimeInfo = async (location: string, opts?: ParsedInfoOptions) => {
+    const logErrors = opts?.log !== false
+    const invalid = opts?.invalid ?? "ignore"
+
     const md = await ConfigMarkdown.parse(location).catch((err) => {
-      log.error("failed to load runtime skill", { skill: location, err })
+      if (logErrors) {
+        log.error("failed to load runtime skill", { skill: location, err })
+      }
+      if (invalid === "throw") {
+        throw new InvalidError({
+          path: location,
+          message: `Invalid skill frontmatter in ${location}`,
+        })
+      }
       return undefined
     })
     if (!md) return
 
     const parsed = Info.pick({ name: true, description: true }).safeParse(md.data)
     if (!parsed.success) {
-      log.warn("invalid runtime skill metadata", { skill: location, issues: parsed.error.issues })
+      if (logErrors) {
+        log.warn("invalid runtime skill metadata", { skill: location, issues: parsed.error.issues })
+      }
+      if (invalid === "throw") {
+        throw new InvalidError({
+          path: location,
+          message: `Invalid skill frontmatter in ${location}`,
+          issues: parsed.error.issues,
+        })
+      }
       return
     }
 
@@ -173,13 +202,15 @@ export namespace Skill {
     } satisfies Info
   }
 
-  const scanRuntimeOverlay = async (root: string) => {
-    const matches = await Glob.scan(SKILL_PATTERN, {
-      cwd: root,
-      absolute: true,
-      include: "file",
-      symlink: true,
-    })
+  const scanRuntimeOverlay = async (root: string, file?: string) => {
+    const matches = file
+      ? [file]
+      : await Glob.scan(SKILL_PATTERN, {
+          cwd: root,
+          absolute: true,
+          include: "file",
+          symlink: true,
+        })
 
     const loaded = await Promise.all(matches.map((match) => parseRuntimeInfo(match)))
     const skills = new Map<string, Info>()
@@ -227,6 +258,8 @@ export namespace Skill {
     return merged
   }
 
+  const runtimeSourceKey = (params: RuntimeLoadInput) => params.file ?? params.root
+
   export function runtimeOverlay(input?: { discovered?: Info[] }): RuntimeOverlay {
     const discovered = new Map((input?.discovered ?? []).map((skill) => [skill.name, skill] as const))
     const discoveredRoots = new Map<string, Map<string, Info>>()
@@ -244,7 +277,7 @@ export namespace Skill {
       return overlay
     }
 
-    const visible = (scope?: RuntimeScope) => {
+    const merged = (scope?: RuntimeScope, opts?: { includeHidden?: boolean }) => {
       let merged = new Map(discovered)
       if (!scope?.workspaceID) return merged
 
@@ -254,9 +287,39 @@ export namespace Skill {
       return mergeOverlay(merged, session.get(runtimeScopeKey("session", scope)))
     }
 
+    const allKnown = (scope?: RuntimeScope) => {
+      let result = new Map(discovered)
+      if (!scope?.workspaceID) return result
+
+      const workspaceState = workspace.get(runtimeScopeKey("workspace", scope))
+      if (workspaceState) {
+        for (const source of workspaceState.sources.values()) {
+          for (const [name, info] of source.skills) {
+            result.set(name, info)
+          }
+        }
+      }
+
+      if (!scope.sessionID) return result
+
+      const sessionState = session.get(runtimeScopeKey("session", scope))
+      if (sessionState) {
+        for (const source of sessionState.sources.values()) {
+          for (const [name, info] of source.skills) {
+            result.set(name, info)
+          }
+        }
+      }
+
+      return result
+    }
+
     return {
       load: async (params: RuntimeLoadInput) => {
-        const skills = await scanRuntimeOverlay(params.root)
+        const skills =
+          !params.file && (params.hide?.length ?? 0) > 0 && !(await Filesystem.exists(params.root))
+            ? new Map<string, Info>()
+            : await scanRuntimeOverlay(params.root, params.file)
 
         if (params.scope === "discovered") {
           for (const [root, source] of discoveredRoots) {
@@ -284,8 +347,9 @@ export namespace Skill {
         }
 
         const overlay = overlayFor(params.scope, params)
+        const sourceKey = runtimeSourceKey(params)
         for (const [root, source] of overlay.sources) {
-          if (root === params.root) continue
+          if (root === sourceKey) continue
 
           for (const name of skills.keys()) {
             if (source.skills.has(name)) {
@@ -294,9 +358,17 @@ export namespace Skill {
           }
         }
 
-        overlay.sources.set(params.root, {
-          skills,
-          hidden: new Set(params.hide ?? []),
+        const previous = overlay.sources.get(sourceKey)
+        const nextSkills = new Map(skills)
+
+        const nextHidden = new Set(previous?.hidden ?? [])
+        for (const name of params.hide ?? []) {
+          nextHidden.add(name)
+        }
+
+        overlay.sources.set(sourceKey, {
+          skills: nextSkills,
+          hidden: nextHidden,
         })
       },
       unload: async (params: RuntimeUnloadInput) => {
@@ -344,9 +416,29 @@ export namespace Skill {
           }
         }
       },
-      all: async (scope?: RuntimeScope) => Array.from(visible(scope).values()).toSorted((a, b) => a.name.localeCompare(b.name)),
-      get: async (name: string, scope?: RuntimeScope) => visible(scope).get(name),
+      all: async (scope?: RuntimeScope, opts?: { includeHidden?: boolean }) =>
+        Array.from((opts?.includeHidden ? allKnown(scope) : merged(scope)).values()).toSorted((a, b) =>
+          a.name.localeCompare(b.name),
+        ),
+      get: async (name: string, scope?: RuntimeScope, opts?: { includeHidden?: boolean }) =>
+        (opts?.includeHidden ? allKnown(scope) : merged(scope)).get(name),
     }
+  }
+
+  export async function runtimeLoad(input: RuntimeLoadInput) {
+    return runtimeState().load(input)
+  }
+
+  export async function runtimeUnload(input: RuntimeUnloadInput) {
+    return runtimeState().unload(input)
+  }
+
+  export async function runtimeAll(scope?: RuntimeScope, opts?: { includeHidden?: boolean }) {
+    return runtimeState().all(scope, opts)
+  }
+
+  export async function runtimeGet(name: string, scope?: RuntimeScope, opts?: { includeHidden?: boolean }) {
+    return runtimeState().get(name, scope, opts)
   }
 
   // TODO: Migrate to Effect
