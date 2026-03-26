@@ -7,6 +7,9 @@ import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID } from "../../src/session/schema"
 import { NamedError } from "@opencode-ai/util/error"
 import { Todo } from "../../src/session/todo"
+import { WorkspaceDiffer } from "../../src/acp/workspace-diff"
+import { Boot } from "../../src/boot"
+import { Instance } from "../../src/project/instance"
 
 const TEST_WORKSPACE = "/tmp/test-workspace"
 
@@ -40,7 +43,7 @@ describe("ACPServer", () => {
     expect(result.result.authenticated).toBe(true)
   })
 
-  test("handles session/new", async () => {
+  test("session/new returns empty plan state", async () => {
     const server = new ACPServer()
     const result = await server.dispatch({
       jsonrpc: "2.0",
@@ -50,9 +53,10 @@ describe("ACPServer", () => {
     })
     expect(result.result.sessionId).toBeDefined()
     expect(result.result.workspace).toBe("/workspace")
+    expect(result.result.plan).toEqual({ entries: [] })
   })
 
-  test("handles session/load for existing session", async () => {
+  test("session/load returns current plan state", async () => {
     const server = new ACPServer()
     const created = await server.dispatch({
       jsonrpc: "2.0",
@@ -68,7 +72,122 @@ describe("ACPServer", () => {
       method: "session/load",
       params: { sessionId },
     })
+
     expect(loaded.result.sessionId).toBe(sessionId)
+    expect(loaded.result.workspace).toBe("/test")
+    expect(loaded.result.plan).toEqual({ entries: [] })
+  })
+
+  test("session/load returns current plan state from persisted todos", async () => {
+    const server = new ACPServer()
+    const created = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = created.result.sessionId
+
+    await Boot.init(TEST_WORKSPACE)
+    await Instance.provide({
+      directory: TEST_WORKSPACE,
+      fn: async () => {
+        Todo.update({
+          sessionID: sessionId,
+          todos: [
+            {
+              content: "Bootstrap persisted plan state",
+              status: "in_progress",
+              priority: "high",
+            },
+            {
+              content: "Cancelled todo is normalized",
+              status: "cancelled",
+              priority: "low",
+            },
+          ],
+        })
+      },
+    })
+
+    const reloadedServer = new ACPServer()
+    const loaded = await reloadedServer.dispatch({
+      jsonrpc: "2.0",
+      id: "2",
+      method: "session/load",
+      params: { sessionId, cwd: TEST_WORKSPACE },
+    })
+
+    expect(loaded.result).toEqual({
+      sessionId,
+      workspace: TEST_WORKSPACE,
+      plan: {
+        entries: [
+          {
+            content: "Bootstrap persisted plan state",
+            status: "in_progress",
+            priority: "high",
+          },
+          {
+            content: "Cancelled todo is normalized",
+            status: "completed",
+            priority: "low",
+          },
+        ],
+      },
+    })
+  })
+
+  test("plan entries coexist additively with sessionId and workspace", async () => {
+    const server = new ACPServer()
+
+    const created = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    expect(created.result.sessionId).toBeDefined()
+    expect(created.result.workspace).toBe(TEST_WORKSPACE)
+    expect(created.result.plan.entries).toEqual([])
+
+    await Boot.init(TEST_WORKSPACE)
+    await Instance.provide({
+      directory: TEST_WORKSPACE,
+      fn: async () => {
+        Todo.update({
+          sessionID: created.result.sessionId,
+          todos: [
+            {
+              content: "Persisted additive bootstrap entry",
+              status: "pending",
+              priority: "medium",
+            },
+          ],
+        })
+      },
+    })
+
+    const loaded = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "2",
+      method: "session/load",
+      params: { sessionId: created.result.sessionId, cwd: TEST_WORKSPACE },
+    })
+
+    expect(loaded.result.sessionId).toBe(created.result.sessionId)
+    expect(loaded.result.workspace).toBe(TEST_WORKSPACE)
+    expect(loaded.result.plan).toEqual({
+      entries: [
+        {
+          content: "Persisted additive bootstrap entry",
+          status: "pending",
+          priority: "medium",
+        },
+      ],
+    })
   })
 
   test("returns error for unknown method", async () => {
@@ -301,6 +420,100 @@ describe("ACPServer", () => {
     })
   })
 
+  test("session/prompt preserves active abort controller when overlapping turn is rejected", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalCancel = SessionPrompt.cancel
+    const originalExecuteAgentLoop = (server as any).executeAgentLoop
+    const promptRelease = Promise.withResolvers<void>()
+    let loopCalls = 0
+
+    ;(server as any).executeAgentLoop = async (_session: unknown, _invocation: unknown, _providerMeta: unknown, requestId: string) => {
+      loopCalls += 1
+      if (requestId === "2") {
+        await promptRelease.promise
+        return
+      }
+      throw new Session.BusyError(sessionId as any)
+    }
+    SessionPrompt.cancel = async () => undefined as any
+
+    try {
+      const first = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "First",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(first.result).toBeNull()
+      await waitFor(() => loopCalls === 1)
+
+      const activeController = (server as any).sessions.get(sessionId)?.abortController
+      expect(activeController).toBeDefined()
+
+      const second = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "3",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Second",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(second.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.id === "3" && msg?.error?.message === `Session is busy: ${sessionId}`,
+        ),
+      )
+
+      expect(loopCalls).toBe(1)
+      expect((server as any).sessions.get(sessionId)?.abortController).toBe(activeController)
+
+      const cancelled = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "4",
+        method: "session/cancel",
+        params: { sessionId },
+      })
+
+      expect(cancelled.result.cancelled).toBe(true)
+      expect(activeController.signal.aborted).toBe(true)
+
+      promptRelease.resolve()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    } finally {
+      promptRelease.resolve()
+      ;(server as any).executeAgentLoop = originalExecuteAgentLoop
+      SessionPrompt.cancel = originalCancel
+    }
+  })
+
   test("session/prompt emits visible error chunk when agent loop fails", async () => {
     const server = new ACPServer()
     const notifications: any[] = []
@@ -344,6 +557,59 @@ describe("ACPServer", () => {
           content: {
             type: "text",
             text: "\n[Agent error: provider failed]\n",
+          },
+        },
+        _meta: {
+          source: "mainagent",
+          agent_name: "default",
+        },
+      },
+    })
+  })
+
+  test("session/prompt normalizes transcript-visible ACP status text touched by path display work", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "C:/repo" },
+    })
+
+    ;(server as any).executeAgentLoop = async () => {
+      throw new Error("failed at c:\\repo\\src\\index.ts")
+    }
+
+    const result = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "2",
+      method: "session/prompt",
+      params: {
+        sessionId: sess.result.sessionId,
+        prompt: "Hello!",
+        _meta: {
+          model: "test-model",
+          baseUrl: "http://localhost",
+          apiKey: "test-key",
+        },
+      },
+    })
+
+    expect(result.result).toBeNull()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(notifications).toContainEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: sess.result.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: "\n[Agent error: failed at /src/index.ts]\n",
           },
         },
         _meta: {
@@ -497,7 +763,7 @@ describe("ACPServer", () => {
             rawOutput: {
               error: "apply_patch verification failed: no hunks found",
             },
-            locations: [{ path: "/workspace/README.md" }],
+            locations: [{ path: ".../workspace/README.md" }],
             content: [
               {
                 type: "content",
@@ -1377,6 +1643,740 @@ describe("ACPServer", () => {
       ])
     } finally {
       ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("todo structured tool update preserves legacy string output", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "todo-structured-call",
+          tool: "todowrite",
+          state: {
+            status: "completed",
+            input: {
+              todos: [
+                {
+                  content: "Project structured todo payloads",
+                  status: "in_progress",
+                  priority: "high",
+                },
+              ],
+            },
+            metadata: {
+              todos: [
+                {
+                  content: "Project structured todo payloads",
+                  status: "in_progress",
+                  priority: "high",
+                },
+              ],
+              summary: {
+                total: 1,
+                inProgress: 1,
+                pending: 0,
+                completed: 0,
+                cancelled: 0,
+              },
+            },
+            output: [
+              "1 todo",
+              "Current focus: Project structured todo payloads",
+              "In progress: 1",
+              "Pending: 0",
+              "Completed: 0",
+              "Cancelled: 0",
+            ].join("\n"),
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+      return undefined
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) =>
+            msg?.method === "session/update" &&
+            msg?.params?.update?.sessionUpdate === "tool_call_update" &&
+            msg?.params?.update?.toolCallId === "todo-structured-call",
+        ),
+      )
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "todo-structured-call",
+            status: "completed",
+            rawOutput: [
+              "1 todo",
+              "Current focus: Project structured todo payloads",
+              "In progress: 1",
+              "Pending: 0",
+              "Completed: 0",
+              "Cancelled: 0",
+            ].join("\n"),
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: [
+                    "1 todo",
+                    "Current focus: Project structured todo payloads",
+                    "In progress: 1",
+                    "Pending: 0",
+                    "Completed: 0",
+                    "Cancelled: 0",
+                  ].join("\n"),
+                },
+              },
+            ],
+            structured: {
+              todos: [
+                {
+                  content: "Project structured todo payloads",
+                  status: "in_progress",
+                  priority: "high",
+                },
+              ],
+              summary: {
+                total: 1,
+                inProgress: 1,
+                pending: 0,
+                completed: 0,
+                cancelled: 0,
+              },
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: TEST_WORKSPACE,
+          },
+        },
+      })
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt keeps tool_call_update locations normalized while preserving internal raw error paths", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "C:/repo" },
+    })
+
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "call-1",
+          tool: "read",
+          state: {
+            status: "error",
+            input: { filePath: "c:\\repo\\src\\index.ts" },
+            error: "failed to read c:\\repo\\src\\index.ts",
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+      return undefined
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "tool_call_update",
+        ),
+      )
+
+      const update = notifications.find(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "tool_call_update",
+      )
+
+      expect(update.params.update.rawOutput).toEqual({
+        error: "failed to read c:\\repo\\src\\index.ts",
+      })
+      expect(update.params.update.locations).toEqual([{ path: "src/index.ts" }])
+      expect(update.params.update.content).toEqual([
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "failed to read /src/index.ts",
+          },
+        },
+      ])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("task structured tool update includes session and resumable fields", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "task-structured-call",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Review ACP output",
+              prompt: "Inspect task output",
+              subagent_type: "general",
+            },
+            metadata: {
+              sessionId: "child-session-123",
+              model: {
+                providerID: "reaslab",
+                modelID: "gpt-5.4",
+              },
+              resultText: "Task finished successfully",
+              resultEmpty: false,
+              taskID: "child-session-123",
+              resumable: {
+                task_id: "child-session-123",
+              },
+            },
+            output: [
+              "task_id: child-session-123 (for resuming to continue this task if needed)",
+              "",
+              "Task finished successfully",
+            ].join("\n"),
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "task-empty-structured-call",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: {
+              description: "Resume ACP task",
+              prompt: "Inspect empty task output",
+              subagent_type: "general",
+              task_id: "child-session-empty",
+            },
+            metadata: {
+              sessionId: "child-session-empty",
+              model: {
+                providerID: "reaslab",
+                modelID: "gpt-5.4",
+              },
+              resultText: "",
+              resultEmpty: true,
+              taskID: "child-session-empty",
+              resumable: {
+                task_id: "child-session-empty",
+              },
+            },
+            output: [
+              "task_id: child-session-empty (for resuming to continue this task if needed)",
+              "",
+              "",
+            ].join("\n"),
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+      return undefined
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.filter(
+          (msg) =>
+            msg?.method === "session/update" &&
+            msg?.params?.update?.sessionUpdate === "tool_call_update" &&
+            String(msg?.params?.update?.toolCallId || "").includes("task-"),
+        ).length === 2,
+      )
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task-structured-call",
+            status: "completed",
+            rawOutput: [
+              "task_id: child-session-123 (for resuming to continue this task if needed)",
+              "",
+              "Task finished successfully",
+            ].join("\n"),
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: [
+                    "task_id: child-session-123 (for resuming to continue this task if needed)",
+                    "",
+                    "Task finished successfully",
+                  ].join("\n"),
+                },
+              },
+            ],
+            structured: {
+              sessionId: "child-session-123",
+              model: {
+                providerID: "reaslab",
+                modelID: "gpt-5.4",
+              },
+              resultText: "Task finished successfully",
+              resultEmpty: false,
+              taskID: "child-session-123",
+              resumable: {
+                task_id: "child-session-123",
+              },
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: TEST_WORKSPACE,
+          },
+        },
+      })
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "task-empty-structured-call",
+            status: "completed",
+            rawOutput: [
+              "task_id: child-session-empty (for resuming to continue this task if needed)",
+              "",
+              "",
+            ].join("\n"),
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: [
+                    "task_id: child-session-empty (for resuming to continue this task if needed)",
+                    "",
+                    "",
+                  ].join("\n"),
+                },
+              },
+            ],
+            structured: {
+              sessionId: "child-session-empty",
+              model: {
+                providerID: "reaslab",
+                modelID: "gpt-5.4",
+              },
+              resultText: "",
+              resultEmpty: true,
+              taskID: "child-session-empty",
+              resumable: {
+                task_id: "child-session-empty",
+              },
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: TEST_WORKSPACE,
+          },
+        },
+      })
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("workspace-sync does not duplicate file diffs already emitted by tool_call_update", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    const originalSnapshot = WorkspaceDiffer.prototype.snapshot
+    const originalComputeDiffs = WorkspaceDiffer.prototype.computeDiffs
+
+    WorkspaceDiffer.prototype.snapshot = async () => undefined
+    WorkspaceDiffer.prototype.computeDiffs = async () => [
+      {
+        absolutePath: `${TEST_WORKSPACE}/README.md`,
+        oldText: "before",
+        newText: "after",
+      },
+      {
+        absolutePath: `${TEST_WORKSPACE}/notes.txt`,
+        oldText: "alpha",
+        newText: "beta",
+      },
+    ]
+
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "write-call",
+          tool: "write",
+          state: {
+            status: "completed",
+            input: { filePath: `${TEST_WORKSPACE}/README.md` },
+            metadata: {},
+            title: "README.md",
+            output: `saved\x00DIFF\x00${JSON.stringify({
+              diff: {
+                type: "diff",
+                path: `${TEST_WORKSPACE}/README.md`,
+                oldText: "before",
+                newText: "after",
+              },
+            })}`,
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+      return undefined
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn",
+        ),
+      )
+
+      const workspaceSyncCalls = notifications.filter(
+        (msg) =>
+          msg?.method === "session/update" &&
+          msg?.params?.update?.sessionUpdate === "tool_call" &&
+          msg?.params?.update?.title === "workspace-sync: notes.txt",
+      )
+      const workspaceSyncUpdates = notifications.filter(
+        (msg) =>
+          msg?.method === "session/update" &&
+          msg?.params?.update?.sessionUpdate === "tool_call_update" &&
+          String(msg?.params?.update?.toolCallId || "").startsWith("ws-sync-"),
+      )
+
+      expect(workspaceSyncCalls).toHaveLength(1)
+      expect(workspaceSyncUpdates).toHaveLength(1)
+      expect(workspaceSyncCalls[0]?.params?.update?.locations).toEqual([{ path: "notes.txt" }])
+      expect(workspaceSyncUpdates[0]?.params?.update?.locations).toEqual([{ path: "notes.txt" }])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+      WorkspaceDiffer.prototype.snapshot = originalSnapshot
+      WorkspaceDiffer.prototype.computeDiffs = originalComputeDiffs
+    }
+  })
+
+  test("workspace-sync emits normalized labels and locations for display surfaces", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "C:/repo" },
+    })
+
+    const originalPrompt = (SessionPrompt as any).prompt
+    const originalComputeDiffs = WorkspaceDiffer.prototype.computeDiffs
+    ;(SessionPrompt as any).prompt = async () => undefined
+    WorkspaceDiffer.prototype.computeDiffs = async () => [
+      {
+        absolutePath: "c:\\repo\\notes.txt",
+        oldText: "alpha",
+        newText: "beta",
+      },
+    ]
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.title === "workspace-sync: notes.txt",
+        ),
+      )
+
+      const toolCall = notifications.find(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "tool_call",
+      )
+      const toolUpdate = notifications.find(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "tool_call_update",
+      )
+
+      expect(toolCall.params.update.rawInput).toEqual({ file: "notes.txt" })
+      expect(toolCall.params.update.title).toBe("workspace-sync: notes.txt")
+      expect(toolCall.params.update.locations).toEqual([{ path: "notes.txt" }])
+      expect(toolUpdate.params.update.rawOutput).toBe("File synced by external tool")
+      expect(toolUpdate.params.update.locations).toEqual([{ path: "notes.txt" }])
+      expect(toolUpdate.params.update.content).toEqual([
+        {
+          type: "diff",
+          path: "notes.txt",
+          oldText: "alpha",
+          newText: "beta",
+        },
+      ])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+      WorkspaceDiffer.prototype.computeDiffs = originalComputeDiffs
+    }
+  })
+
+  test("workspace-sync diff dedupe does not merge case-variant paths on case-sensitive platforms", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "/tmp/case-sensitive-workspace" },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    const originalSnapshot = WorkspaceDiffer.prototype.snapshot
+    const originalComputeDiffs = WorkspaceDiffer.prototype.computeDiffs
+
+    WorkspaceDiffer.prototype.snapshot = async () => undefined
+    WorkspaceDiffer.prototype.computeDiffs = async () => [
+      {
+        absolutePath: "/tmp/case-sensitive-workspace/readme.md",
+        oldText: "alpha",
+        newText: "beta",
+      },
+    ]
+
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: PartID.ascending(),
+          messageID: MessageID.ascending(),
+          sessionID: input.sessionID as any,
+          type: "tool",
+          callID: "write-call",
+          tool: "write",
+          state: {
+            status: "completed",
+            input: { filePath: "/tmp/case-sensitive-workspace/README.md" },
+            metadata: {},
+            title: "README.md",
+            output: `saved\x00DIFF\x00${JSON.stringify({
+              diff: {
+                type: "diff",
+                path: "/tmp/case-sensitive-workspace/README.md",
+                oldText: "before",
+                newText: "after",
+              },
+            })}`,
+            time: { start: Date.now(), end: Date.now() },
+          },
+        },
+      })
+      return undefined
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn",
+        ),
+      )
+
+      const workspaceSyncCalls = notifications.filter(
+        (msg) =>
+          msg?.method === "session/update" &&
+          msg?.params?.update?.sessionUpdate === "tool_call" &&
+          String(msg?.params?.update?.toolCallId || "").startsWith("ws-sync-"),
+      )
+      const workspaceSyncUpdates = notifications.filter(
+        (msg) =>
+          msg?.method === "session/update" &&
+          msg?.params?.update?.sessionUpdate === "tool_call_update" &&
+          String(msg?.params?.update?.toolCallId || "").startsWith("ws-sync-"),
+      )
+
+      expect(workspaceSyncCalls).toHaveLength(1)
+      expect(workspaceSyncUpdates).toHaveLength(1)
+      expect(workspaceSyncCalls[0]?.params?.update?.locations).toEqual([{ path: "readme.md" }])
+      expect(workspaceSyncUpdates[0]?.params?.update?.locations).toEqual([{ path: "readme.md" }])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+      WorkspaceDiffer.prototype.snapshot = originalSnapshot
+      WorkspaceDiffer.prototype.computeDiffs = originalComputeDiffs
     }
   })
 })

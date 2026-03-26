@@ -25,6 +25,37 @@ describe("ACP Protocol", () => {
     expect(msg.params.update.title).toBe("write_file")
   })
 
+  test("relativePath normalizes exact workspace-root behavior to slash output", () => {
+    expect(ACP.relativePath("/workspace", "/workspace")).toBe("/")
+    expect(ACP.relativePath("C:\\repo", "c:/repo")).toBe("/")
+  })
+
+  test("relativePath handles mixed slash styles and drive-letter case differences", () => {
+    expect(ACP.relativePath("c:\\repo\\src\\file.ts", "C:/repo")).toBe("src/file.ts")
+    expect(ACP.relativePath("C:/repo/src/file.ts", "c:\\repo")).toBe("src/file.ts")
+  })
+
+  test("relativePath keeps same-prefix siblings outside the workspace", () => {
+    expect(ACP.relativePath("C:\\repo2\\file.ts", "C:\\repo")).toBe(".../repo2/file.ts")
+  })
+
+  test("relativePath uses deterministic outside-workspace fallback", () => {
+    expect(ACP.relativePath("D:\\logs\\folder\\file.ts", "C:\\repo")).toBe(".../folder/file.ts")
+  })
+
+  test("toolTitle normalizes display paths for named ACP surfaces", () => {
+    expect(ACP.toolTitle("read", { filePath: "c:\\repo\\src\\index.ts" }, "C:/repo")).toBe("src/index.ts")
+    expect(ACP.toolTitle("workspace-sync", { file: "c:\\repo\\notes.txt" }, "C:/repo")).toBe("workspace-sync: notes.txt")
+  })
+
+  test("tool_call locations use normalized display paths while preserving internal raw input", () => {
+    const msg = ACP.toolCall("sess-1", "call-1", "read", { filePath: "c:\\repo\\src\\index.ts" }, "C:/repo")
+
+    expect(msg.params.update.rawInput).toEqual({ filePath: "c:\\repo\\src\\index.ts" })
+    expect(msg.params.update.locations).toEqual([{ path: "src/index.ts" }])
+    expect(msg.params.update.title).toBe("src/index.ts")
+  })
+
   test("creates tool_call_update", () => {
     const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", "ok")
     expect(msg.params.update.sessionUpdate).toBe("tool_call_update")
@@ -179,6 +210,74 @@ describe("ACP Protocol", () => {
     expect(msg.params.update.locations).toEqual([{ path: "src/acp/protocol.ts" }])
   })
 
+  test("tool_call_update locations normalize display paths and preserve internal absolute payload data", () => {
+    const msg = ACP.toolCallUpdate(
+      "sess-1",
+      "call-1",
+      "completed",
+      { savedTo: "C:\\repo\\src\\index.ts" },
+      {
+        type: "diff",
+        path: "c:\\repo\\src\\index.ts",
+        newText: "export {}",
+      },
+      { workspace: "C:/repo" },
+      { path: "C:\\repo\\src\\index.ts" },
+    )
+
+    expect(msg.params.update.rawOutput).toEqual({ savedTo: "C:\\repo\\src\\index.ts" })
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "diff",
+        path: "src/index.ts",
+        newText: "export {}",
+      },
+    ])
+    expect(msg.params.update.locations).toEqual([{ path: "src/index.ts" }])
+  })
+
+  test("tool_call_update transcript-visible locations text uses slash-normalized display output", () => {
+    const msg = ACP.toolCallUpdate(
+      "sess-1",
+      "call-1",
+      "failed",
+      { error: "Failed at C:\\repo\\src\\index.ts from c:/repo" },
+      undefined,
+      { workspace: "C:/repo" },
+    )
+
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "Failed at /src/index.ts from /",
+        },
+      },
+    ])
+  })
+
+  test("tool_call_update transcript-visible locations text does not mangle same-prefix sibling paths", () => {
+    const msg = ACP.toolCallUpdate(
+      "sess-1",
+      "call-1",
+      "failed",
+      { error: "Failed at C:/repo2/file.ts while workspace is C:/repo" },
+      undefined,
+      { workspace: "C:/repo" },
+    )
+
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "Failed at C:/repo2/file.ts while workspace is /",
+        },
+      },
+    ])
+  })
+
   test("no existing protocol expectation breaks when structured is absent", () => {
     const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", { result: "ok" })
 
@@ -215,6 +314,22 @@ describe("ACP Protocol", () => {
         { content: "Inspect project context", priority: "high", status: "in_progress" },
         { content: "Write tests", priority: "medium", status: "completed" },
       ],
+    })
+  })
+
+  test("session bootstrap result includes additive plan entries alongside sessionId and workspace", () => {
+    const result = ACP.sessionBootstrapResult("sess-1", "/workspace", [
+      { content: "Bootstrap entry", priority: "high", status: "pending" },
+    ])
+
+    expect(result).toEqual({
+      sessionId: "sess-1",
+      workspace: "/workspace",
+      plan: {
+        entries: [
+          { content: "Bootstrap entry", priority: "high", status: "pending" },
+        ],
+      },
     })
   })
 

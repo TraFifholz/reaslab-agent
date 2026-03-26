@@ -29,17 +29,65 @@ const DIFF_SENTINEL = "\x00DIFF\x00"
 /** Structured diff info carrying optional reaslab collaborative editor sync payload */
 export interface ToolResult {
   diff?: { type: "diff"; path: string; oldText?: string; newText: string }
+  structured?: unknown
+}
+
+function metadataRecord(metadata: unknown): Record<string, unknown> | undefined {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined
+  return metadata as Record<string, unknown>
+}
+
+export function projectStructuredToolPayload(toolId: string, metadata: unknown): unknown {
+  const record = metadataRecord(metadata)
+  if (!record) return undefined
+
+  switch (toolId) {
+    case "todowrite":
+    case "todoread": {
+      const structured: Record<string, unknown> = {}
+      if (Array.isArray(record.todos)) structured.todos = record.todos
+      if (record.summary && typeof record.summary === "object") structured.summary = record.summary
+      return Object.keys(structured).length > 0 ? structured : undefined
+    }
+    case "task": {
+      const structured: Record<string, unknown> = {}
+      if (typeof record.sessionId === "string") structured.sessionId = record.sessionId
+      if (record.model && typeof record.model === "object") structured.model = record.model
+      if (typeof record.resultText === "string") structured.resultText = record.resultText
+      if (typeof record.resultEmpty === "boolean") structured.resultEmpty = record.resultEmpty
+      if (typeof record.taskID === "string") structured.taskID = record.taskID
+      if (record.resumable && typeof record.resumable === "object") structured.resumable = record.resumable
+      return Object.keys(structured).length > 0 ? structured : undefined
+    }
+    default:
+      return undefined
+  }
+}
+
+function encodeToolOutput(output: string, result: ToolResult): string {
+  if (result.diff === undefined && result.structured === undefined) return output
+  return output + DIFF_SENTINEL + JSON.stringify(result)
 }
 
 /** Decode a tool output string that may carry an embedded diff */
-export function decodeToolOutput(raw: unknown): { output: string; diff?: ToolResult["diff"] } {
+export function decodeToolOutput(raw: unknown): { output: string; diff?: ToolResult["diff"]; structured?: unknown } {
   if (typeof raw !== "string") return { output: String(raw) }
   const idx = raw.indexOf(DIFF_SENTINEL)
   if (idx === -1) return { output: raw }
   const output = raw.slice(0, idx)
   try {
-    const diff = JSON.parse(raw.slice(idx + DIFF_SENTINEL.length))
-    return { output, diff }
+    const decoded = JSON.parse(raw.slice(idx + DIFF_SENTINEL.length)) as ToolResult["diff"] | ToolResult
+    if (decoded && typeof decoded === "object" && "type" in decoded && decoded.type === "diff") {
+      return { output, diff: decoded }
+    }
+    if (decoded && typeof decoded === "object") {
+      return {
+        output,
+        diff: (decoded as ToolResult).diff,
+        structured: (decoded as ToolResult).structured,
+      }
+    }
+    return { output }
   } catch {
     return { output }
   }
@@ -47,17 +95,15 @@ export function decodeToolOutput(raw: unknown): { output: string; diff?: ToolRes
 
 /** Shared side-channel: toolCallId → diff, populated during tool execution */
 export const pendingDiffs = new Map<string, ToolResult["diff"]>()
-function makeCtx(signal: AbortSignal): Tool.Context {
+
+function makeCtx(base: Tool.Context, signal: AbortSignal): Tool.Context {
   return {
-    sessionID: "acp-session" as any,
-    messageID: "acp-msg" as any,
-    agent: "default",
+    ...base,
     abort: signal,
-    callID: undefined,
-    extra: { collaborativeMode: true },
-    messages: [],
-    metadata: () => {},
-    ask: async () => {},
+    extra: {
+      ...base.extra,
+      collaborativeMode: true,
+    },
   }
 }
 
@@ -73,6 +119,7 @@ async function adaptTool(
   info: Tool.Info,
   signal: AbortSignal,
   workspace: string,
+  toolContext?: Tool.Context,
 ): Promise<{ name: string; tool: any }> {
   const initialized = await info.init()
   const isFileWriter = FILE_WRITE_TOOLS.has(info.id)
@@ -84,6 +131,10 @@ async function adaptTool(
       description: initialized.description,
       parameters: initialized.parameters as any,
       execute: async (args: Record<string, unknown>): Promise<string> => {
+        if (!toolContext) {
+          throw new Error(`Built-in ACP tool '${info.id}' requires a real ACP tool context`)
+        }
+
         const absPath = isFileWriter ? resolveFilePath(info.id, args as any, workspace) : undefined
 
         // Read old content before modification
@@ -93,8 +144,9 @@ async function adaptTool(
         }
 
         try {
-          const result = await initialized.execute(args as any, makeCtx(signal))
-          const output = result.output.replaceAll(workspace + "/", "").replaceAll(workspace, ".")
+          const result = await initialized.execute(args as any, makeCtx(toolContext, signal))
+          const output = result.output
+          const structured = projectStructuredToolPayload(info.id, result.metadata)
 
           // For file-modifying tools, embed diff as sentinel suffix for reaslab sync
           if (absPath) {
@@ -102,11 +154,11 @@ async function adaptTool(
             try { newText = await fs.readFile(absPath, "utf-8") } catch {}
             if (newText !== undefined) {
                const diff: ToolResult["diff"] = { type: "diff", path: absPath, oldText, newText }
-               return output + DIFF_SENTINEL + JSON.stringify(diff)
-            }
+               return encodeToolOutput(output, { diff, structured })
+             }
           }
 
-          return output
+          return encodeToolOutput(output, { structured })
         } catch (err: any) {
           throw new Error(err?.message || String(err))
         }
@@ -116,7 +168,7 @@ async function adaptTool(
 }
 
 /** Build the full built-in ToolSet to pass to streamText */
-export async function buildBuiltinTools(signal: AbortSignal, workspace: string): Promise<ToolSet> {
+export async function buildBuiltinTools(signal: AbortSignal, workspace: string, toolContext?: Tool.Context): Promise<ToolSet> {
   const infos: Tool.Info[] = [
     BashTool,
     ReadTool,
@@ -134,7 +186,7 @@ export async function buildBuiltinTools(signal: AbortSignal, workspace: string):
     BatchTool,
   ]
 
-  const entries = await Promise.allSettled(infos.map((info) => adaptTool(info, signal, workspace)))
+  const entries = await Promise.allSettled(infos.map((info) => adaptTool(info, signal, workspace, toolContext)))
 
   const toolset: ToolSet = {}
   for (const result of entries) {

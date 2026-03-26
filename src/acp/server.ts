@@ -7,7 +7,7 @@ import type { ProviderMeta } from "../provider/provider"
 import { Boot } from "../boot"
 import { MCP } from "../mcp"
 import { Instance } from "../project/instance"
-import { decodeToolOutput } from "./builtin-tools"
+import { decodeToolOutput, projectStructuredToolPayload } from "./builtin-tools"
 import { Session } from "../session"
 import { SessionPrompt } from "../session/prompt"
 import { MessageV2 } from "../session/message-v2"
@@ -21,11 +21,21 @@ import { todoToPlanEntries } from "./plan"
 
 const PROTOCOL_VERSION = "0.1.0"
 
+function normalizeEmittedPath(pathValue: string) {
+  const originalNormalized = pathValue.replace(/\\+/g, "/")
+  const normalized = path.resolve(pathValue).replace(/\\+/g, "/")
+  return /^[A-Z]:/i.test(originalNormalized) ? normalized.toLowerCase() : normalized
+}
+
 interface SessionState {
   id: string
   workspace: string
   mcpServers: MCPServerConfig[]
   abortController?: AbortController
+}
+
+interface SessionTurn {
+  abortController: AbortController
 }
 
 export interface MCPServerConfig {
@@ -68,6 +78,20 @@ export class ACPServer {
       this.onNotification(msg)
     }
     writeACP(msg as object)
+  }
+
+  private claimTurn(session: SessionState): SessionTurn {
+    const turn = {
+      abortController: new AbortController(),
+    }
+    session.abortController = turn.abortController
+    return turn
+  }
+
+  private releaseTurn(session: SessionState, turn: SessionTurn) {
+    if (session.abortController === turn.abortController) {
+      session.abortController = undefined
+    }
   }
 
   /** Dispatch a JSON-RPC request to the appropriate handler */
@@ -132,7 +156,7 @@ export class ACPServer {
       mcpServers: (params.mcpServers as MCPServerConfig[]) || [],
     }
     this.sessions.set(session.id, session)
-    return { sessionId: session.id, workspace: session.workspace }
+    return ACP.sessionBootstrapResult(session.id, session.workspace, [])
   }
 
   private async handleSessionLoad(params: Record<string, unknown>) {
@@ -157,13 +181,23 @@ export class ACPServer {
 
     if (params.cwd) session.workspace = params.cwd as string
     if (params.mcpServers) session.mcpServers = params.mcpServers as MCPServerConfig[]
-    return { sessionId: session.id, workspace: session.workspace }
+
+    const entries = await Instance.provide({
+      directory: session.workspace,
+      fn: async () => todoToPlanEntries(Todo.get(session.id as SessionID)),
+    })
+
+    return ACP.sessionBootstrapResult(session.id, session.workspace, entries)
   }
 
   private async handleSessionPrompt(params: Record<string, unknown>, requestId: string | number): Promise<null> {
     const sessionId = params.sessionId as string
     const session = this.sessions.get(sessionId)
     if (!session) throw new Error(`Session not found: ${sessionId}`)
+    if (session.abortController && !session.abortController.signal.aborted) {
+      this._notify(ACP.error(requestId, -32603, `Session is busy: ${sessionId}`))
+      return null
+    }
 
     const meta = (params._meta || params.meta || {}) as Record<string, unknown>
     const prompt = params.prompt as string | unknown[]
@@ -180,20 +214,20 @@ export class ACPServer {
       throw new Error("_meta must include model, baseUrl, and apiKey")
     }
 
-    const abortController = new AbortController()
-    session.abortController = abortController
+    const turn = this.claimTurn(session)
 
     this.executeAgentLoop(session, invocation, providerMeta, requestId)
       .catch((err) => {
         console.error(`[acp] agent loop error for ${sessionId}:`, err)
         if (err instanceof Session.BusyError) {
+          this.releaseTurn(session, turn)
           this._notify(ACP.error(requestId, -32603, `Session is busy: ${sessionId}`))
           return
         }
-        this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${err.message}]\n`))
+        this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${err.message}]\n`, { workspace: session.workspace }))
         this._notify(ACP.response(requestId, { stopReason: "error", error: err.message }))
       })
-      .finally(() => { session.abortController = undefined })
+      .finally(() => { this.releaseTurn(session, turn) })
 
     return null
   }
@@ -281,6 +315,7 @@ export class ACPServer {
     requestId: string | number,
   ): Promise<void> {
     await Boot.init(session.workspace)
+    const turnAbortController = session.abortController
 
     await Instance.provide({
       directory: session.workspace,
@@ -305,6 +340,7 @@ export class ACPServer {
 
         const sessionId = session.id
         const partTypes = new Map<string, string>()
+        const emittedDiffPaths = new Set<string>()
 
         const unsubPartUpdated = Bus.subscribe(MessageV2.Event.PartUpdated, (event) => {
           const part = event.properties.part
@@ -320,7 +356,9 @@ export class ACPServer {
               if (part.state.status === "running") {
                 this._notify(ACP.toolCall(sessionId, part.callID, part.tool, (part.state.input ?? {}) as Record<string, unknown>, session.workspace))
               } else if (part.state.status === "completed") {
-                const { output: rawOutput, diff } = decodeToolOutput(part.state.output)
+                const { output: rawOutput, diff, structured: encodedStructured } = decodeToolOutput(part.state.output)
+                const structured = encodedStructured ?? projectStructuredToolPayload(part.tool, part.state.metadata)
+                if (diff) emittedDiffPaths.add(normalizeEmittedPath(diff.path))
                 this._notify(
                   ACP.toolCallUpdate(
                     sessionId,
@@ -332,6 +370,7 @@ export class ACPServer {
                     {
                       path: (part.state.input?.filePath ?? part.state.input?.path ?? part.state.input?.file ?? "") as string,
                     },
+                    structured,
                   ),
                 )
               } else if (part.state.status === "error") {
@@ -368,7 +407,7 @@ export class ACPServer {
           if (event.properties.sessionID !== sessionId) return
           const message = event.properties.error?.data?.message || "Unknown error"
           sessionErrorMessage = message
-          this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${message}]\n`))
+          this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${message}]\n`, { workspace: session.workspace }))
         })
 
         const unsubTodoUpdated = Bus.subscribe(Todo.Event.Updated, (event) => {
@@ -417,13 +456,14 @@ export class ACPServer {
 
           // Workspace diff safety net: emit synthetic notifications for any
           // files changed during the turn (catches MCP tool writes, etc.)
-          if (!session.abortController?.signal.aborted) {
+          if (!turnAbortController?.signal.aborted) {
             const wsDiffs = await wsDiff.computeDiffs(session.workspace).catch((err: any) => {
               console.error("[workspace-diff] computeDiffs error:", err)
               return []
             })
             let counter = 0
             for (const diff of wsDiffs) {
+              if (emittedDiffPaths.has(normalizeEmittedPath(diff.absolutePath))) continue
               const relPath = path.relative(session.workspace, diff.absolutePath)
               const syntheticId = `ws-sync-${Date.now()}-${++counter}-${path.basename(diff.absolutePath)}`
               this._notify(ACP.toolCall(sessionId, syntheticId, "workspace-sync", { file: relPath }, session.workspace))

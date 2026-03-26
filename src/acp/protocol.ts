@@ -65,6 +65,14 @@ export namespace ACP {
     status: "pending" | "in_progress" | "completed"
   }
 
+  export interface SessionBootstrapResult {
+    sessionId: string
+    workspace: string
+    plan: {
+      entries: PlanEntry[]
+    }
+  }
+
   const DEFAULT_META: UpdateMeta = {
     source: "mainagent",
     agent_name: "default",
@@ -105,34 +113,78 @@ export namespace ACP {
   function relativizeText(text: string, workspace?: string): string {
     if (!text || !workspace) return text
 
-    const variants = [workspace]
+    const normalizedWorkspace = normalizeDisplayPath(workspace)
+    const variants = [normalizedWorkspace]
+    if (/^[A-Z]:/i.test(normalizedWorkspace)) {
+      variants.push(normalizedWorkspace.replace(/^[A-Z]/, (drive) => drive.toLowerCase()))
+      variants.push(normalizedWorkspace.replace(/^[a-z]/, (drive) => drive.toUpperCase()))
+    }
     try {
-      variants.push(Filesystem.resolve(workspace))
+      const resolvedWorkspace = normalizeDisplayPath(Filesystem.resolve(workspace))
+      variants.push(resolvedWorkspace)
+      if (/^[A-Z]:/i.test(resolvedWorkspace)) {
+        variants.push(resolvedWorkspace.replace(/^[A-Z]/, (drive) => drive.toLowerCase()))
+        variants.push(resolvedWorkspace.replace(/^[a-z]/, (drive) => drive.toUpperCase()))
+      }
     } catch {
       // Keep original workspace only.
     }
 
-    let result = text
+    let result = normalizeDisplayPath(text)
     for (const variant of new Set(variants.filter(Boolean))) {
-      result = result.replaceAll(`${variant}/`, "")
-      result = result.replaceAll(`${variant}\\`, "")
+      const escapedVariant = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      result = result.replace(new RegExp(`${escapedVariant}(?=$|/)`, "g"), "/")
     }
-    return result
+    return result.replace(/\/+/g, "/")
+  }
+
+  function normalizeDisplayPath(path: string): string {
+    if (!path) return path
+
+    const normalized = path.replace(/\\+/g, "/")
+    return normalized.replace(/^([a-zA-Z]):/, (_, drive) => `${drive.toUpperCase()}:`)
+  }
+
+  function normalizeComparePath(path: string): string {
+    const normalized = normalizeDisplayPath(path).replace(/\/+$/, "")
+    if (/^[A-Z]:/i.test(normalized)) return normalized.toLowerCase()
+    return normalized || "/"
+  }
+
+  function outsideWorkspaceDisplayPath(path: string): string {
+    const normalized = normalizeDisplayPath(path)
+    const withoutRoot = normalized
+      .replace(/^[A-Z]:\/?/i, "")
+      .replace(/^\//, "")
+    const segments = withoutRoot.split("/").filter(Boolean)
+
+    if (segments.length === 0) return normalized
+    if (segments.length === 1) return `.../${segments[0]}`
+    return `.../${segments.slice(-2).join("/")}`
   }
 
   export function relativePath(p: string, workspace?: string): string {
     if (!p) return p
-    if (!workspace) return p
 
-    if (p.startsWith(workspace)) {
-      return p.slice(workspace.length).replace(/^[/\\]/, "") || p
+    const normalizedPath = normalizeDisplayPath(p)
+    if (!workspace) return normalizedPath
+
+    const normalizedWorkspace = normalizeComparePath(workspace)
+    const comparablePath = normalizeComparePath(normalizedPath)
+
+    if (comparablePath === normalizedWorkspace) return "/"
+
+    const workspaceDisplay = normalizeDisplayPath(workspace).replace(/\/+$/, "")
+    const prefix = normalizedWorkspace === "/" ? "/" : `${normalizedWorkspace}/`
+    if (comparablePath.startsWith(prefix)) {
+      return normalizedPath.slice(workspaceDisplay.length).replace(/^[/\\]/, "") || "/"
     }
 
-    const normalizedWorkspace = Filesystem.resolve(workspace)
-    const normalizedPath = Filesystem.resolve(Filesystem.windowsPath(p))
-    if (!Filesystem.contains(normalizedWorkspace, normalizedPath)) return p
+    if (/^(?:[A-Z]:\/|\/)/i.test(normalizedPath)) {
+      return outsideWorkspaceDisplayPath(normalizedPath)
+    }
 
-    return normalizedPath.slice(normalizedWorkspace.length).replace(/^[/\\]/, "") || p
+    return normalizedPath
   }
 
   function textContent(text: string) {
@@ -192,6 +244,7 @@ export namespace ACP {
       case "write": return filePath || "write"
       case "edit": return filePath || "edit"
       case "multiedit": return filePath || "multiedit"
+      case "workspace-sync": return filePath ? `workspace-sync: ${filePath}` : "workspace-sync"
       case "glob": return pattern || filePath || "glob"
       case "grep": return pattern ? `grep: ${String(pattern).slice(0, 40)}` : "grep"
       case "webfetch": return (rawInput.url as string) || "webfetch"
@@ -295,6 +348,16 @@ export namespace ACP {
       jsonrpc: "2.0" as const,
       id,
       error: { code, message },
+    }
+  }
+
+  export function sessionBootstrapResult(sessionId: string, workspace: string, entries: PlanEntry[]): SessionBootstrapResult {
+    return {
+      sessionId,
+      workspace,
+      plan: {
+        entries,
+      },
     }
   }
 }
