@@ -3,6 +3,39 @@ import { Tool } from "./tool"
 import DESCRIPTION_WRITE from "./todowrite.txt"
 import { Todo } from "../session/todo"
 
+function summarizeTodos(todos: Todo.Info[]) {
+  const summary = {
+    total: todos.length,
+    inProgress: todos.filter((todo) => todo.status === "in_progress").length,
+    pending: todos.filter((todo) => todo.status === "pending").length,
+    completed: todos.filter((todo) => todo.status === "completed").length,
+    cancelled: todos.filter((todo) => todo.status === "cancelled").length,
+  }
+  const openCount = todos.filter(
+    (todo) => todo.status !== "completed" && todo.status !== "cancelled",
+  ).length
+  const lines = [`${openCount} ${openCount === 1 ? "todo" : "todos"}`]
+  const inProgress = todos.find((todo) => todo.status === "in_progress")
+
+  if (inProgress) {
+    lines.push(`Current focus: ${inProgress.content}`)
+    lines.push(`In progress: ${summary.inProgress}`)
+    lines.push(`Pending: ${summary.pending}`)
+  } else {
+    lines.push(`Pending: ${summary.pending}`)
+    lines.push(`In progress: ${summary.inProgress}`)
+  }
+
+  lines.push(`Completed: ${summary.completed}`)
+  lines.push(`Cancelled: ${summary.cancelled}`)
+
+  return {
+    output: lines.join("\n"),
+    summary,
+    openCount,
+  }
+}
+
 export const TodoWriteTool = Tool.define("todowrite", {
   description: DESCRIPTION_WRITE,
   parameters: z.object({
@@ -20,11 +53,13 @@ export const TodoWriteTool = Tool.define("todowrite", {
       sessionID: ctx.sessionID,
       todos: params.todos,
     })
+    const result = summarizeTodos(params.todos)
     return {
-      title: `${params.todos.filter((x) => x.status !== "completed").length} todos`,
-      output: JSON.stringify(params.todos, null, 2),
+      title: `${result.openCount} ${result.openCount === 1 ? "todo" : "todos"}`,
+      output: result.output,
       metadata: {
         todos: params.todos,
+        summary: result.summary,
       },
     }
   },
@@ -42,12 +77,14 @@ export const TodoReadTool = Tool.define("todoread", {
     })
 
     const todos = await Todo.get(ctx.sessionID)
+    const result = summarizeTodos(todos)
     return {
-      title: `${todos.filter((x) => x.status !== "completed").length} todos`,
+      title: `${result.openCount} ${result.openCount === 1 ? "todo" : "todos"}`,
       metadata: {
         todos,
+        summary: result.summary,
       },
-      output: JSON.stringify(todos, null, 2),
+      output: result.output,
     }
   },
 })

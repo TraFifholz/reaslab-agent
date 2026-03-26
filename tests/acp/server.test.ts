@@ -626,7 +626,307 @@ describe("ACPServer", () => {
       ;(SessionPrompt as any).prompt = originalPrompt
     }
   })
+
+  test("emits plan updates during live prompts with no agent gating", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      Todo.update({
+        sessionID: input.sessionID as any,
+        todos: [
+          {
+            content: "Canonical live plan signal",
+            status: "in_progress",
+            priority: "high",
+          },
+        ],
+      })
+
+      return {
+        info: {
+          role: "assistant",
+          agent: "explore",
+        },
+      }
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+        ),
+      )
+
+      const planNotification = notifications.find(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+      )
+
+      expect(planNotification).toEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "plan",
+            entries: [
+              {
+                content: "Canonical live plan signal",
+                status: "in_progress",
+                priority: "high",
+              },
+            ],
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: TEST_WORKSPACE,
+          },
+        },
+      })
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        id: "2",
+        result: {
+          stopReason: "end_turn",
+        },
+      })
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("emits empty plan updates when todos become empty", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      Todo.update({
+        sessionID: input.sessionID as any,
+        todos: [
+          {
+            content: "Transient plan item",
+            status: "pending",
+            priority: "medium",
+          },
+        ],
+      })
+
+      Todo.update({
+        sessionID: input.sessionID as any,
+        todos: [],
+      })
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() => planUpdates(notifications).length === 2)
+
+      expect(planUpdates(notifications)).toEqual([
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "plan",
+              entries: [
+                {
+                  content: "Transient plan item",
+                  status: "pending",
+                  priority: "medium",
+                },
+              ],
+            },
+            _meta: {
+              source: "mainagent",
+              agent_name: "default",
+              workspace: TEST_WORKSPACE,
+            },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "plan",
+              entries: [],
+            },
+            _meta: {
+              source: "mainagent",
+              agent_name: "default",
+              workspace: TEST_WORKSPACE,
+            },
+          },
+        },
+      ])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("child session todo activity does not overwrite parent session plan updates", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const parent = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const parentSessionId = parent.result.sessionId
+    let childSessionId: string | undefined
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      Todo.update({
+        sessionID: input.sessionID as any,
+        todos: [
+          {
+            content: "Parent plan remains canonical",
+            status: "in_progress",
+            priority: "high",
+          },
+        ],
+      })
+
+      const child = await Session.createNext({
+        directory: TEST_WORKSPACE,
+        parentID: input.sessionID as any,
+      })
+      childSessionId = child.id
+
+      Todo.update({
+        sessionID: child.id,
+        todos: [
+          {
+            content: "Child plan should stay isolated",
+            status: "pending",
+            priority: "low",
+          },
+        ],
+      })
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: parentSessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.jsonrpc === "2.0" && msg?.id === "2" && msg?.result?.stopReason === "end_turn",
+        ),
+      )
+
+      expect(childSessionId).toBeDefined()
+      expect(
+        planUpdates(notifications).filter((msg) => msg?.params?.sessionId === childSessionId),
+      ).toEqual([])
+
+      expect(planUpdates(notifications)).toEqual([
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: parentSessionId,
+            update: {
+              sessionUpdate: "plan",
+              entries: [
+                {
+                  content: "Parent plan remains canonical",
+                  status: "in_progress",
+                  priority: "high",
+                },
+              ],
+            },
+            _meta: {
+              source: "mainagent",
+              agent_name: "default",
+              workspace: TEST_WORKSPACE,
+            },
+          },
+        },
+      ])
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
 })
+
+function planUpdates(notifications: any[]) {
+  return notifications.filter(
+    (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+  )
+}
 
 async function waitFor(check: () => boolean, timeout = 1000) {
   const start = Date.now()

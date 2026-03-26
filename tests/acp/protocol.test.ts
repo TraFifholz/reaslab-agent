@@ -26,7 +26,7 @@ describe("ACP Protocol", () => {
   })
 
   test("creates tool_call_update", () => {
-    const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", "ok", [{ type: "text", text: "done" }])
+    const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", "ok")
     expect(msg.params.update.sessionUpdate).toBe("tool_call_update")
     expect(msg.params.update.status).toBe("completed")
     expect(msg.params.update.rawOutput).toBe("ok")
@@ -73,6 +73,132 @@ describe("ACP Protocol", () => {
         },
       },
     ])
+  })
+
+  test("structured tool update supports optional additive structured payloads", () => {
+    const structured = {
+      type: "json",
+      value: {
+        status: "ok",
+        count: 2,
+      },
+    }
+
+    const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", "ok", undefined, undefined, undefined, structured)
+
+    expect(msg.params.update.rawOutput).toBe("ok")
+    expect(msg.params.update.structured).toEqual(structured)
+  })
+
+  test("content remains usable for string-only consumers when structured is present", () => {
+    const msg = ACP.toolCallUpdate(
+      "sess-1",
+      "call-1",
+      "completed",
+      "plain text output",
+      undefined,
+      undefined,
+      undefined,
+      {
+        type: "json",
+        value: {
+          detail: "machine readable",
+        },
+      },
+    )
+
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "plain text output",
+        },
+      },
+    ])
+  })
+
+  test("rawOutput undefined still produces valid text content", () => {
+    const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", undefined)
+
+    expect(msg.params.update.rawOutput).toBeUndefined()
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "undefined",
+        },
+      },
+    ])
+  })
+
+  test("rawOutput circular objects fall back to valid text content without throwing", () => {
+    const circular: { self?: unknown } = {}
+    circular.self = circular
+
+    const call = () => ACP.toolCallUpdate("sess-1", "call-1", "completed", circular)
+
+    expect(call).not.toThrow()
+
+    const msg = call()
+    expect(msg.params.update.rawOutput).toBe(circular)
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "[object Object]",
+        },
+      },
+    ])
+  })
+
+  test("diff updates keep rawOutput and relativize diff paths", () => {
+    const msg = ACP.toolCallUpdate(
+      "sess-1",
+      "call-1",
+      "completed",
+      "patched",
+      {
+        type: "diff",
+        path: "/workspace/src/acp/protocol.ts",
+        newText: "new text",
+      },
+      { workspace: "/workspace" },
+    )
+
+    expect(msg.params.update.rawOutput).toBe("patched")
+    expect(msg.params.update.content).toEqual([
+      {
+        type: "diff",
+        path: "src/acp/protocol.ts",
+        newText: "new text",
+      },
+    ])
+    expect(msg.params.update.locations).toEqual([{ path: "src/acp/protocol.ts" }])
+  })
+
+  test("no existing protocol expectation breaks when structured is absent", () => {
+    const msg = ACP.toolCallUpdate("sess-1", "call-1", "completed", { result: "ok" })
+
+    expect(msg.params.update).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call-1",
+      status: "completed",
+      rawOutput: { result: "ok" },
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: JSON.stringify({ result: "ok" }),
+          },
+        },
+      ],
+      locations: undefined,
+    })
+    expect("structured" in msg.params.update).toBe(false)
   })
 
   test("creates plan update notifications", () => {

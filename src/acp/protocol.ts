@@ -145,6 +145,22 @@ export namespace ACP {
     }
   }
 
+  function textOutput(rawOutput: unknown, workspace?: string): string {
+    if (typeof rawOutput === "string") {
+      return relativizeText(rawOutput, workspace)
+    }
+
+    if (typeof rawOutput === "object" && rawOutput !== null && "error" in rawOutput && typeof rawOutput.error === "string") {
+      return relativizeText(rawOutput.error, workspace)
+    }
+
+    try {
+      return String(JSON.stringify(rawOutput) ?? rawOutput)
+    } catch {
+      return String(rawOutput)
+    }
+  }
+
   /** Create plan update notification */
   export function planUpdate(sessionId: string, entries: PlanEntry[], meta?: Partial<UpdateMeta>) {
     return {
@@ -226,6 +242,7 @@ export namespace ACP {
     diff?: { type: "diff"; path: string; oldText?: string; newText: string },
     meta?: Partial<UpdateMeta>,
     location?: { path?: string },
+    structured?: unknown,
   ) {
     const workspace = typeof meta?.workspace === "string" ? meta.workspace : undefined
     const normalizedDiff = diff
@@ -234,31 +251,28 @@ export namespace ACP {
           path: relativePath(diff.path, workspace),
         }
       : undefined
-    const outputText =
-      typeof rawOutput === "string"
-        ? relativizeText(rawOutput, workspace)
-        : typeof rawOutput === "object" && rawOutput !== null && "error" in rawOutput && typeof rawOutput.error === "string"
-          ? relativizeText(rawOutput.error, workspace)
-          : JSON.stringify(rawOutput)
+    const outputText = textOutput(rawOutput, workspace)
     const content = normalizedDiff ? [normalizedDiff] : [textContent(outputText)]
     const locations = location?.path
       ? [{ path: relativePath(location.path, workspace) }]
       : normalizedDiff
         ? [{ path: normalizedDiff.path }]
         : undefined
+    const update = {
+      sessionUpdate: "tool_call_update" as const,
+      toolCallId,
+      status,
+      rawOutput,
+      content,
+      locations,
+      ...(structured === undefined ? {} : { structured }),
+    }
     return {
       jsonrpc: "2.0" as const,
       method: "session/update",
       params: {
         sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          status,
-          rawOutput,
-          content,
-          locations,
-        },
+        update,
         _meta: { ...DEFAULT_META, ...meta },
       },
     }

@@ -86,6 +86,17 @@ export const TaskTool = Tool.define("task", async (ctx) => {
             throw new Error(`Task session does not belong to current parent session: ${params.task_id}`)
           }
 
+          const messages = await Session.messages({ sessionID: found.id })
+          const lastAssistant = messages.findLast((message) => message.info.role === "assistant")
+          const lastSubtask = messages
+            .findLast((message) => message.parts.some((part) => part.type === "subtask"))
+            ?.parts.findLast((part) => part.type === "subtask")
+          const sessionAgent = lastAssistant?.info.agent ?? lastSubtask?.agent
+
+          if (sessionAgent && sessionAgent !== agent.name) {
+            throw new Error(`Task session agent does not match requested subagent_type: ${params.task_id}`)
+          }
+
           return found
         }
 
@@ -128,14 +139,6 @@ export const TaskTool = Tool.define("task", async (ctx) => {
         providerID: msg.info.providerID,
       }
 
-      ctx.metadata({
-        title: params.description,
-        metadata: {
-          sessionId: session.id,
-          model,
-        },
-      })
-
       const messageID = MessageID.ascending()
 
       function cancel() {
@@ -163,21 +166,31 @@ export const TaskTool = Tool.define("task", async (ctx) => {
       })
 
       const text = result.parts.findLast((x) => x.type === "text")?.text ?? ""
+      const resultMetadata = {
+        sessionId: session.id,
+        model,
+        resultText: text,
+        resultEmpty: !text,
+        taskID: session.id,
+        resumable: {
+          task_id: session.id,
+        },
+      }
+
+      ctx.metadata({
+        title: params.description,
+        metadata: resultMetadata,
+      })
 
       const output = [
         `task_id: ${session.id} (for resuming to continue this task if needed)`,
         "",
-        "<task_result>",
         text,
-        "</task_result>",
       ].join("\n")
 
       return {
         title: params.description,
-        metadata: {
-          sessionId: session.id,
-          model,
-        },
+        metadata: resultMetadata,
         output,
       }
     },

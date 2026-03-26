@@ -63,7 +63,9 @@ describe("TaskTool", () => {
     await fs.mkdir(path.join(WORKTREE_DIRECTORY, "migration"), { recursive: true })
     ;(SessionPrompt as any).prompt = async ({ messageID, sessionID }: { messageID: MessageID; sessionID: SessionID }) => {
       promptCallCount += 1
-      return createPromptResult({ messageID, sessionID })
+      const result = createPromptResult({ messageID, sessionID })
+      await Session.updateMessage(result.info)
+      return result
     }
   })
 
@@ -153,8 +155,9 @@ describe("TaskTool", () => {
     },
   ) {
     const tool = await TaskTool.init()
+    const metadataCalls: Array<{ title?: string; metadata?: Record<string, unknown> }> = []
 
-    return await tool.execute(
+    const result = await tool.execute(
       {
         description: input.description ?? "test task",
         prompt: input.prompt ?? "run task",
@@ -168,10 +171,55 @@ describe("TaskTool", () => {
         abort: new AbortController().signal,
         messages: [],
         extra: options.bypassAgentCheck === undefined ? { bypassAgentCheck: true } : { bypassAgentCheck: options.bypassAgentCheck },
-        metadata() {},
+        metadata(input) {
+          metadataCalls.push(input as { title?: string; metadata?: Record<string, unknown> })
+        },
         ask: options.ask ?? (async () => {}),
       },
     )
+
+    return {
+      result,
+      metadataCalls,
+    }
+  }
+
+  async function createInterruptedChildSession(parentID: SessionID, subagentType: string) {
+    const child = await Session.create({
+      parentID,
+      title: `interrupted (@${subagentType} subagent)`,
+    })
+    const userMessageID = MessageID.ascending()
+
+    await Session.updateMessage({
+      id: userMessageID,
+      sessionID: child.id,
+      role: "user",
+      time: {
+        created: Date.now(),
+      },
+      agent: "build",
+      model: {
+        providerID: ProviderID.openai,
+        modelID: MODEL_ID,
+      },
+    })
+
+    await Session.updatePart({
+      id: PartID.ascending(),
+      sessionID: child.id,
+      messageID: userMessageID,
+      type: "subtask",
+      agent: subagentType,
+      description: "interrupted task",
+      prompt: "run task",
+      model: {
+        providerID: ProviderID.openai,
+        modelID: MODEL_ID,
+      },
+    })
+
+    return child.id
   }
 
   function parseTaskID(output: string) {
@@ -183,12 +231,44 @@ describe("TaskTool", () => {
   test("fresh subagent invocation creates a child session", async () => {
     await withinInstance(async () => {
       const parent = await createExecutionContext()
-      const result = await executeTask({}, parent)
+      const { result, metadataCalls } = await executeTask({}, parent)
       const childID = SessionID.make(parseTaskID(result.output))
       const child = await Session.get(childID)
 
       expect(child.parentID).toBe(parent.sessionID)
+      expect(result.output).toContain(`task_id: ${childID}`)
+      expect(result.output).not.toContain("<task_result>")
+      expect(result.output).not.toContain("</task_result>")
       expect(result.output).toContain("subagent ok")
+      expect(result.metadata.sessionId).toBe(childID)
+      expect(result.metadata.model).toEqual({
+        modelID: MODEL_ID,
+        providerID: ProviderID.openai,
+      })
+      expect(result.metadata.resultText).toBe("subagent ok")
+      expect(result.metadata.resultEmpty).toBe(false)
+      expect(result.metadata.taskID).toBe(childID)
+      expect(result.metadata.resumable).toEqual({
+        task_id: childID,
+      })
+      expect(metadataCalls).toEqual([
+        {
+          title: "test task",
+          metadata: {
+            sessionId: childID,
+            model: {
+              modelID: MODEL_ID,
+              providerID: ProviderID.openai,
+            },
+            resultText: "subagent ok",
+            resultEmpty: false,
+            taskID: childID,
+            resumable: {
+              task_id: childID,
+            },
+          },
+        },
+      ])
       expect(promptCallCount).toBe(1)
     })
   })
@@ -196,11 +276,11 @@ describe("TaskTool", () => {
   test("valid task_id resumes the same child session and returns that same child session ID", async () => {
     await withinInstance(async () => {
       const parent = await createExecutionContext()
-      const first = await executeTask({}, parent)
+      const { result: first } = await executeTask({}, parent)
       const childID = parseTaskID(first.output)
       const childSessionsBeforeResume = await Session.children(parent.sessionID)
 
-      const resumed = await executeTask({ task_id: childID }, parent)
+      const { result: resumed } = await executeTask({ task_id: childID }, parent)
       const childSessionsAfterResume = await Session.children(parent.sessionID)
 
       expect(parseTaskID(resumed.output)).toBe(childID)
@@ -211,11 +291,60 @@ describe("TaskTool", () => {
     })
   })
 
+  test("resuming with the same task_id and subagent_type allows a different description", async () => {
+    await withinInstance(async () => {
+      const parent = await createExecutionContext()
+      const { result: first } = await executeTask({ description: "first label", subagent_type: "general" }, parent)
+      const childID = parseTaskID(first.output)
+      const promptCallsBeforeResume = promptCallCount
+
+      const { result: resumed } = await executeTask(
+        {
+          description: "updated label",
+          subagent_type: "general",
+          task_id: childID,
+        },
+        parent,
+      )
+
+      expect(parseTaskID(resumed.output)).toBe(childID)
+      expect((await Session.get(SessionID.make(childID))).parentID).toBe(parent.sessionID)
+      expect(promptCallCount).toBe(promptCallsBeforeResume + 1)
+    })
+  })
+
+  test("resuming with a different subagent_type is rejected", async () => {
+    await withinInstance(async () => {
+      const parent = await createExecutionContext()
+      const { result: first } = await executeTask({ subagent_type: "general" }, parent)
+      const childID = parseTaskID(first.output)
+      const promptCallsBeforeInvalidResume = promptCallCount
+
+      await expect(executeTask({ task_id: childID, subagent_type: "explore" }, parent)).rejects.toThrow(
+        `Task session agent does not match requested subagent_type: ${childID}`,
+      )
+      expect(promptCallCount).toBe(promptCallsBeforeInvalidResume)
+    })
+  })
+
+  test("resuming an interrupted child session with a different subagent_type is rejected", async () => {
+    await withinInstance(async () => {
+      const parent = await createExecutionContext()
+      const childID = await createInterruptedChildSession(parent.sessionID, "general")
+      const promptCallsBeforeInvalidResume = promptCallCount
+
+      await expect(executeTask({ task_id: childID, subagent_type: "explore" }, parent)).rejects.toThrow(
+        `Task session agent does not match requested subagent_type: ${childID}`,
+      )
+      expect(promptCallCount).toBe(promptCallsBeforeInvalidResume)
+    })
+  })
+
   test("task_id from a different parent session is rejected", async () => {
     await withinInstance(async () => {
       const parentA = await createExecutionContext()
       const parentB = await createExecutionContext()
-      const first = await executeTask({}, parentA)
+      const { result: first } = await executeTask({}, parentA)
       const childID = parseTaskID(first.output)
       const promptCallsBeforeInvalidResume = promptCallCount
 

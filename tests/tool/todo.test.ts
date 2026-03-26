@@ -8,13 +8,14 @@ import { Config } from "../../src/config/config"
 import { Instance } from "../../src/project/instance"
 import { Session } from "../../src/session"
 import { Database } from "../../src/storage/db"
-import { TodoWriteTool } from "../../src/tool/todo"
+import { TodoReadTool, TodoWriteTool } from "../../src/tool/todo"
 
-describe("TodoWriteTool", () => {
-  const dataDir = path.join(tmpdir(), `reaslab-agent-tool-todo-${randomUUID()}`)
+describe("todo tools", () => {
   const workspace = path.resolve(import.meta.dir, "../..")
+  let dataDir: string
 
   beforeEach(() => {
+    dataDir = path.join(tmpdir(), `reaslab-agent-tool-todo-${randomUUID()}`)
     process.env.DATA_DIR = dataDir
     process.env.PROJECT_WORKSPACE = workspace
     Config.reset()
@@ -31,7 +32,7 @@ describe("TodoWriteTool", () => {
     rmSync(dataDir, { recursive: true, force: true })
   })
 
-  test("returns JSON output text and full todos metadata", async () => {
+  test("todowrite returns summary output and preserves full todos metadata", async () => {
     await Boot.init(workspace)
 
     await Instance.provide({
@@ -65,8 +66,156 @@ describe("TodoWriteTool", () => {
           },
         )
 
-        expect(result.output).toBe(JSON.stringify(todos, null, 2))
+        expect(result.output).toBe(
+          [
+            "2 todos",
+            "Current focus: Keep todowrite output stable",
+            "In progress: 1",
+            "Pending: 1",
+            "Completed: 0",
+            "Cancelled: 0",
+          ].join("\n"),
+        )
         expect(result.metadata.todos).toEqual(todos)
+        expect(result.metadata.summary).toEqual({
+          total: 2,
+          inProgress: 1,
+          pending: 1,
+          completed: 0,
+          cancelled: 0,
+        })
+      },
+    })
+  })
+
+  test("todowrite excludes cancelled todos from remaining count without current focus", async () => {
+    await Boot.init(workspace)
+
+    await Instance.provide({
+      directory: workspace,
+      fn: async () => {
+        const session = await Session.createNext({ directory: workspace })
+        const todos = [
+          {
+            content: "Leave no-focus branch covered",
+            status: "pending",
+            priority: "high",
+          },
+          {
+            content: "Keep cancelled out of remaining count",
+            status: "cancelled",
+            priority: "low",
+          },
+        ]
+
+        const tool = await TodoWriteTool.init()
+        const result = await tool.execute(
+          { todos },
+          {
+            sessionID: session.id,
+            messageID: "message-test" as any,
+            agent: "default",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata() {},
+            ask: async () => {},
+          },
+        )
+
+        expect(result.title).toBe("1 todo")
+        expect(result.output).toBe(
+          [
+            "1 todo",
+            "Pending: 1",
+            "In progress: 0",
+            "Completed: 0",
+            "Cancelled: 1",
+          ].join("\n"),
+        )
+        expect(result.metadata.todos).toEqual(todos)
+        expect(result.metadata.summary).toEqual({
+          total: 2,
+          inProgress: 0,
+          pending: 1,
+          completed: 0,
+          cancelled: 1,
+        })
+      },
+    })
+  })
+
+  test("todoread returns summary output and preserves full todos metadata", async () => {
+    await Boot.init(workspace)
+
+    await Instance.provide({
+      directory: workspace,
+      fn: async () => {
+        const session = await Session.createNext({ directory: workspace })
+        const todos = [
+          {
+            content: "Ship summary-first todo output",
+            status: "in_progress",
+            priority: "high",
+          },
+          {
+            content: "Keep metadata todos unchanged",
+            status: "cancelled",
+            priority: "low",
+          },
+          {
+            content: "Document count stability in tests",
+            status: "pending",
+            priority: "medium",
+          },
+        ]
+
+        const writeTool = await TodoWriteTool.init()
+        await writeTool.execute(
+          { todos },
+          {
+            sessionID: session.id,
+            messageID: "message-test" as any,
+            agent: "default",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata() {},
+            ask: async () => {},
+          },
+        )
+
+        const readTool = await TodoReadTool.init()
+        const result = await readTool.execute(
+          {},
+          {
+            sessionID: session.id,
+            messageID: "message-test" as any,
+            agent: "default",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata() {},
+            ask: async () => {},
+          },
+        )
+
+        expect(result.output).toBe(
+          [
+            "2 todos",
+            "Current focus: Ship summary-first todo output",
+            "In progress: 1",
+            "Pending: 1",
+            "Completed: 0",
+            "Cancelled: 1",
+          ].join("\n"),
+        )
+        expect(result.title).toBe("2 todos")
+        expect(result.metadata.todos).toEqual(todos)
+        expect(result.metadata.summary).toEqual({
+          total: 3,
+          inProgress: 1,
+          pending: 1,
+          completed: 0,
+          cancelled: 1,
+        })
       },
     })
   })
