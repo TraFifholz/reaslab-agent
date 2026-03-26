@@ -770,6 +770,105 @@ describe("ACPServer", () => {
     }
   })
 
+  test("session/prompt slash execution preserves ACP chunk and end_turn completion semantics", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      const messageID = MessageID.ascending()
+      const partID = PartID.ascending()
+
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: partID,
+          messageID,
+          sessionID: input.sessionID as any,
+          type: "text",
+        },
+      })
+      await Bus.publish(MessageV2.Event.PartDelta, {
+        sessionID: input.sessionID as any,
+        messageID,
+        partID,
+        delta: "Running init...",
+      })
+
+      return {
+        info: { id: messageID } as PromptResult["info"],
+      } as PromptResult
+    }
+    SessionPrompt.prompt = async (input) => {
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "/init",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "agent_message_chunk",
+        ) && notifications.some((msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn"),
+      )
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sess.result.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: "Running init...",
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+          },
+        },
+      })
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        id: "2",
+        result: {
+          stopReason: "end_turn",
+        },
+      })
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
+    }
+  })
+
   test("emits plan updates when todos change", async () => {
     const server = new ACPServer()
     const notifications: any[] = []
