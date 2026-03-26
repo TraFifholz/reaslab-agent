@@ -863,6 +863,17 @@ describe("ACPServer", () => {
           stopReason: "end_turn",
         },
       })
+
+      const chunkIndex = notifications.findIndex(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "agent_message_chunk",
+      )
+      const responseIndex = notifications.findIndex(
+        (msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn",
+      )
+
+      expect(chunkIndex).toBeGreaterThanOrEqual(0)
+      expect(responseIndex).toBeGreaterThanOrEqual(0)
+      expect(chunkIndex).toBeLessThan(responseIndex)
     } finally {
       SessionPrompt.command = originalCommand
       SessionPrompt.prompt = originalPrompt
