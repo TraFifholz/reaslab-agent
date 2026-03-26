@@ -60,7 +60,7 @@ export const LspTool = Tool.define("lsp", {
 
     await LSP.touchFile(file, true)
 
-    const result: unknown[] = await (async () => {
+    const response = await (async () => {
       switch (args.operation) {
         case "goToDefinition":
           return LSP.definition(position)
@@ -82,6 +82,8 @@ export const LspTool = Tool.define("lsp", {
           return LSP.outgoingCalls(position)
       }
     })()
+
+    const result = Array.isArray(response) ? response : response ? [response] : []
 
     const output = (() => {
       if (result.length === 0) return `No results found for ${args.operation}`
