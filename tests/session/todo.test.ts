@@ -13,7 +13,7 @@ import { Todo } from "../../src/session/todo"
 
 describe("Todo.update", () => {
   const dataDir = path.join(tmpdir(), `reaslab-agent-todo-${randomUUID()}`)
-  const workspace = path.join("D:\\Workspace\\reaslab-agent\\.worktrees\\todo-plan-acp-alignment")
+  const workspace = path.resolve(import.meta.dir, "../..")
 
   beforeEach(() => {
     process.env.DATA_DIR = dataDir
@@ -32,7 +32,7 @@ describe("Todo.update", () => {
     rmSync(dataDir, { recursive: true, force: true })
   })
 
-  test("publishes an updated event with the persisted ordered todo list", async () => {
+  test("publishes an updated event after persisting the ordered todo list", async () => {
     await Boot.init(workspace)
 
     await Instance.provide({
@@ -52,11 +52,18 @@ describe("Todo.update", () => {
           },
         ]
 
-        const eventPromise = new Promise<{ sessionID: typeof session.id; todos: typeof todos }>((resolve) => {
+        const eventPromise = new Promise<{
+          sessionID: typeof session.id
+          todos: typeof todos
+          persistedTodos: typeof todos
+        }>((resolve) => {
           const unsubscribe = Bus.subscribe(Todo.Event.Updated, (event) => {
             if (event.properties.sessionID !== session.id) return
             unsubscribe()
-            resolve(event.properties)
+            resolve({
+              ...event.properties,
+              persistedTodos: Todo.get(session.id),
+            })
           })
         })
 
@@ -67,10 +74,11 @@ describe("Todo.update", () => {
 
         const event = await eventPromise
 
-        expect(Todo.get(session.id)).toEqual(todos)
+        expect(event.persistedTodos).toEqual(todos)
         expect(event).toEqual({
           sessionID: session.id,
           todos,
+          persistedTodos: todos,
         })
       },
     })
