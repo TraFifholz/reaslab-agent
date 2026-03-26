@@ -232,8 +232,9 @@ export class ACPServer {
     }
 
     const newlineIndex = prompt.indexOf("\n")
-    const firstLine = newlineIndex === -1 ? prompt : prompt.slice(0, newlineIndex)
-    const remaining = newlineIndex === -1 ? "" : prompt.slice(newlineIndex + 1)
+    const hasMultilineBody = newlineIndex !== -1
+    const firstLine = hasMultilineBody ? prompt.slice(0, newlineIndex) : prompt
+    const remaining = hasMultilineBody ? prompt.slice(newlineIndex + 1) : ""
     const withoutSlash = firstLine.slice(1)
     const firstWhitespace = withoutSlash.search(/\s/)
     const command = firstWhitespace === -1
@@ -251,10 +252,10 @@ export class ACPServer {
     return {
       type: "command",
       command,
-      arguments: remaining
+      arguments: hasMultilineBody
         ? inlineArguments
           ? `${inlineArguments}\n${remaining}`
-          : remaining
+          : `\n${remaining}`
         : inlineArguments,
     }
   }

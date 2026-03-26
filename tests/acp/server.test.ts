@@ -191,6 +191,26 @@ describe("ACPServer", () => {
       })
     })
 
+    test("preserves trailing empty multiline lines for slash-only commands", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/init\n")).toEqual({
+        type: "command",
+        command: "init",
+        arguments: "\n",
+      })
+    })
+
+    test("preserves trailing empty multiline lines after same-line arguments", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/review HEAD~1\n")).toEqual({
+        type: "command",
+        command: "review",
+        arguments: "HEAD~1\n",
+      })
+    })
+
     test("returns an empty-command error for slash-only input", () => {
       const server = new ACPServer()
 
