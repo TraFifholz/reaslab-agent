@@ -14,8 +14,6 @@ import { MessageV2 } from "../session/message-v2"
 import { Bus } from "../bus"
 import { ACPProviderMeta } from "./provider-meta"
 import type { SessionID } from "../session/schema"
-import { Todo } from "../session/todo"
-import { todoToPlanEntries } from "./plan"
 
 const PROTOCOL_VERSION = "0.1.0"
 
@@ -279,22 +277,6 @@ export class ACPServer {
           this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${message}]\n`))
         })
 
-        const unsubTodoUpdated = Bus.subscribe(Todo.Event.Updated, (event) => {
-          if (event.properties.sessionID !== sessionId) return
-
-          try {
-            this._notify(
-              ACP.planUpdate(
-                sessionId,
-                todoToPlanEntries(event.properties.todos),
-                { workspace: session.workspace },
-              ),
-            )
-          } catch (error) {
-            console.error(`[acp] failed to emit plan update for ${sessionId}:`, error)
-          }
-        })
-
         try {
           await SessionPrompt.prompt({
             sessionID: sessionId as SessionID,
@@ -306,7 +288,6 @@ export class ACPServer {
           unsubPartUpdated()
           unsubPartDelta()
           unsubSessionError()
-          unsubTodoUpdated()
           partTypes.clear()
           delete ACPProviderMeta()[session.id]
         }
