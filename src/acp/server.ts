@@ -13,7 +13,7 @@ import { SessionPrompt } from "../session/prompt"
 import { MessageV2 } from "../session/message-v2"
 import { Bus } from "../bus"
 import { ACPProviderMeta } from "./provider-meta"
-import type { SessionID } from "../session/schema"
+import { MessageID, type SessionID } from "../session/schema"
 import { WorkspaceDiffer } from "./workspace-diff"
 import path from "path"
 import { Todo } from "../session/todo"
@@ -41,6 +41,21 @@ export interface JsonRpcRequest {
   method: string
   params?: Record<string, unknown>
 }
+
+type PromptInputPart =
+  | { type: "text"; text: string }
+  | { type: "file"; url: string; filename: string; mime: string }
+
+type PromptInvocation =
+  | {
+      type: "prompt"
+      parts: PromptInputPart[]
+    }
+  | {
+      type: "command"
+      command: string
+      arguments: string
+    }
 
 export class ACPServer {
   private sessions = new Map<string, SessionState>()
@@ -152,7 +167,7 @@ export class ACPServer {
 
     const meta = (params._meta || params.meta || {}) as Record<string, unknown>
     const prompt = params.prompt as string | unknown[]
-    const parts = this.parsePromptToInputParts(prompt)
+    const invocation = this.resolvePromptInvocation(prompt)
 
     const providerMeta: ProviderMeta = {
       model: (meta.model as string) || "",
@@ -168,7 +183,7 @@ export class ACPServer {
     const abortController = new AbortController()
     session.abortController = abortController
 
-    this.executeAgentLoop(session, parts, providerMeta, requestId)
+    this.executeAgentLoop(session, invocation, providerMeta, requestId)
       .catch((err) => {
         console.error(`[acp] agent loop error for ${sessionId}:`, err)
         if (err instanceof Session.BusyError) {
@@ -201,8 +216,52 @@ export class ACPServer {
 
   // --- Prompt parsing ---
 
+  private resolvePromptInvocation(prompt: string | unknown[]): PromptInvocation {
+    if (typeof prompt !== "string") {
+      return {
+        type: "prompt",
+        parts: this.parsePromptToInputParts(prompt),
+      }
+    }
+
+    if (!prompt.startsWith("/")) {
+      return {
+        type: "prompt",
+        parts: this.parsePromptToInputParts(prompt),
+      }
+    }
+
+    const newlineIndex = prompt.indexOf("\n")
+    const hasMultilineBody = newlineIndex !== -1
+    const firstLine = hasMultilineBody ? prompt.slice(0, newlineIndex) : prompt
+    const remaining = hasMultilineBody ? prompt.slice(newlineIndex + 1) : ""
+    const withoutSlash = firstLine.slice(1)
+    const firstWhitespace = withoutSlash.search(/\s/)
+    const command = firstWhitespace === -1
+      ? withoutSlash
+      : withoutSlash.slice(0, firstWhitespace)
+
+    if (!command) {
+      throw new Error("Empty slash command")
+    }
+
+    const inlineArguments = firstWhitespace === -1
+      ? ""
+      : withoutSlash.slice(firstWhitespace).trimStart()
+
+    return {
+      type: "command",
+      command,
+      arguments: hasMultilineBody
+        ? inlineArguments
+          ? `${inlineArguments}\n${remaining}`
+          : `\n${remaining}`
+        : inlineArguments,
+    }
+  }
+
   /** Parse ACP prompt content blocks into SessionPrompt input parts */
-  parsePromptToInputParts(prompt: string | unknown[]): Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }> {
+  parsePromptToInputParts(prompt: string | unknown[]): PromptInputPart[] {
     if (typeof prompt === "string") return [{ type: "text", text: prompt }]
     if (!Array.isArray(prompt)) return [{ type: "text", text: String(prompt) }]
     return prompt.map((block: any) => {
@@ -217,7 +276,7 @@ export class ACPServer {
 
   private async executeAgentLoop(
     session: SessionState,
-    parts: Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }>,
+    invocation: PromptInvocation,
     providerMeta: ProviderMeta,
     requestId: string | number,
   ): Promise<void> {
@@ -329,12 +388,7 @@ export class ACPServer {
         })
 
         try {
-          const result = await SessionPrompt.prompt({
-            sessionID: sessionId as SessionID,
-            model: { providerID: "reaslab" as any, modelID: (providerMeta.model || "unknown") as any },
-            agent: "build",
-            parts,
-          })
+          const result = await this.executePromptInvocation(sessionId, invocation, providerMeta)
 
           const assistantErrorMessage =
             result &&
@@ -391,6 +445,30 @@ export class ACPServer {
     })
 
     this._notify(ACP.response(requestId, { stopReason: "end_turn" }))
+  }
+
+  private executePromptInvocation(
+    sessionId: string,
+    invocation: PromptInvocation,
+    providerMeta: ProviderMeta,
+  ) {
+    if (invocation.type === "prompt") {
+      return SessionPrompt.prompt({
+        sessionID: sessionId as SessionID,
+        model: { providerID: "reaslab" as any, modelID: (providerMeta.model || "unknown") as any },
+        agent: "build",
+        parts: invocation.parts,
+      })
+    }
+
+    return SessionPrompt.command({
+      sessionID: sessionId as SessionID,
+      messageID: MessageID.ascending(),
+      command: invocation.command,
+      arguments: invocation.arguments,
+      model: providerMeta.model,
+      agent: "build",
+    })
   }
 
   // --- Main loop ---

@@ -10,6 +10,10 @@ import { Todo } from "../../src/session/todo"
 
 const TEST_WORKSPACE = "/tmp/test-workspace"
 
+type PromptResult = Awaited<ReturnType<typeof SessionPrompt.prompt>>
+type PromptInput = Parameters<typeof SessionPrompt.prompt>[0]
+type CommandInput = Parameters<typeof SessionPrompt.command>[0]
+
 describe("ACPServer", () => {
   test("handles initialize", async () => {
     const server = new ACPServer()
@@ -157,6 +161,101 @@ describe("ACPServer", () => {
       url: "file:///test.ts",
       filename: "test.ts",
       mime: "text/typescript",
+    })
+  })
+
+  describe("slash prompt resolution", () => {
+    test("resolves /init as slash command", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/init")).toEqual({
+        type: "command",
+        command: "init",
+        arguments: "",
+      })
+    })
+
+    test("resolves /review HEAD~1 as slash command", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/review HEAD~1")).toEqual({
+        type: "command",
+        command: "review",
+        arguments: "HEAD~1",
+      })
+    })
+
+    test("resolves multiline slash arguments", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/review HEAD~1\nfocus acp")).toEqual({
+        type: "command",
+        command: "review",
+        arguments: "HEAD~1\nfocus acp",
+      })
+    })
+
+    test("preserves trailing empty multiline lines for slash-only commands", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/init\n")).toEqual({
+        type: "command",
+        command: "init",
+        arguments: "\n",
+      })
+    })
+
+    test("preserves trailing empty multiline lines after same-line arguments", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("/review HEAD~1\n")).toEqual({
+        type: "command",
+        command: "review",
+        arguments: "HEAD~1\n",
+      })
+    })
+
+    test("returns an empty-command error for slash-only input", () => {
+      const server = new ACPServer()
+
+      expect(() => (server as any).resolvePromptInvocation("/")).toThrow("Empty slash command")
+    })
+
+    test("does not recognize slash commands with leading whitespace", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation(" /init")).toEqual({
+        type: "prompt",
+        parts: [{ type: "text", text: " /init" }],
+      })
+    })
+
+    test("does not recognize non-leading slash text", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("hello /init")).toEqual({
+        type: "prompt",
+        parts: [{ type: "text", text: "hello /init" }],
+      })
+    })
+
+    test("does not recognize plain text as a slash command", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("hello")).toEqual({
+        type: "prompt",
+        parts: [{ type: "text", text: "hello" }],
+      })
+    })
+
+    test("keeps structured prompt arrays in normal prompt mode", () => {
+      const server = new ACPServer()
+      const prompt = [{ type: "text", text: "/init" }]
+
+      expect((server as any).resolvePromptInvocation(prompt)).toEqual({
+        type: "prompt",
+        parts: [{ type: "text", text: "/init" }],
+      })
     })
   })
 
@@ -418,6 +517,366 @@ describe("ACPServer", () => {
       })
     } finally {
       ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt routes /init through SessionPrompt.command", async () => {
+    const server = new ACPServer()
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const commandCalls: CommandInput[] = []
+    const promptCalls: PromptInput[] = []
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      commandCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+      } as PromptResult
+    }
+    SessionPrompt.prompt = async (input) => {
+      promptCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "/init",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() => commandCalls.length === 1)
+      expect(commandCalls).toHaveLength(1)
+      expect(promptCalls).toHaveLength(0)
+      expect(commandCalls[0]?.command).toBe("init")
+      expect(commandCalls[0]?.arguments).toBe("")
+      expect(commandCalls[0]?.sessionID).toBe(sess.result.sessionId)
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt keeps ordinary text on SessionPrompt.prompt", async () => {
+    const server = new ACPServer()
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const commandCalls: CommandInput[] = []
+    const promptCalls: PromptInput[] = []
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      commandCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+      } as PromptResult
+    }
+    SessionPrompt.prompt = async (input) => {
+      promptCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() => promptCalls.length === 1)
+      expect(promptCalls).toHaveLength(1)
+      expect(commandCalls).toHaveLength(0)
+      expect(promptCalls[0]?.parts).toEqual([{ type: "text", text: "Hello!" }])
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt surfaces unknown slash commands through ACP", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      throw new Error(`Command not found: "${input.command}"`)
+    }
+    SessionPrompt.prompt = async (input) => {
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "/unknown",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.id === "2" && msg?.result?.stopReason === "error",
+        ),
+      )
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sess.result.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: "\n[Agent error: Command not found: \"unknown\"]\n",
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+          },
+        },
+      })
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        id: "2",
+        result: {
+          stopReason: "error",
+          error: "Command not found: \"unknown\"",
+        },
+      })
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt preserves multiline slash arguments through SessionPrompt.command", async () => {
+    const server = new ACPServer()
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const commandCalls: CommandInput[] = []
+    const promptCalls: PromptInput[] = []
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      commandCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+      } as PromptResult
+    }
+    SessionPrompt.prompt = async (input) => {
+      promptCalls.push(input)
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "/review HEAD~1\nfocus acp",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() => commandCalls.length === 1)
+      expect(commandCalls).toHaveLength(1)
+      expect(promptCalls).toHaveLength(0)
+      expect(commandCalls[0]?.command).toBe("review")
+      expect(commandCalls[0]?.arguments).toBe("HEAD~1\nfocus acp")
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
+    }
+  })
+
+  test("session/prompt slash execution preserves ACP chunk and end_turn completion semantics", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: TEST_WORKSPACE },
+    })
+
+    const originalCommand = SessionPrompt.command
+    const originalPrompt = SessionPrompt.prompt
+
+    SessionPrompt.command = async (input) => {
+      const messageID = MessageID.ascending()
+      const partID = PartID.ascending()
+
+      await Bus.publish(MessageV2.Event.PartUpdated, {
+        part: {
+          id: partID,
+          messageID,
+          sessionID: input.sessionID as any,
+          type: "text",
+        },
+      })
+      await Bus.publish(MessageV2.Event.PartDelta, {
+        sessionID: input.sessionID as any,
+        messageID,
+        partID,
+        delta: "Running init...",
+      })
+
+      return {
+        info: { id: messageID } as PromptResult["info"],
+      } as PromptResult
+    }
+    SessionPrompt.prompt = async (input) => {
+      return {
+        info: { id: MessageID.ascending() } as PromptResult["info"],
+        parts: input.parts,
+      } as PromptResult
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId: sess.result.sessionId,
+          prompt: "/init",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "agent_message_chunk",
+        ) && notifications.some((msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn"),
+      )
+
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: sess.result.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: "Running init...",
+            },
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+          },
+        },
+      })
+      expect(notifications).toContainEqual({
+        jsonrpc: "2.0",
+        id: "2",
+        result: {
+          stopReason: "end_turn",
+        },
+      })
+
+      const chunkIndex = notifications.findIndex(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "agent_message_chunk",
+      )
+      const responseIndex = notifications.findIndex(
+        (msg) => msg?.id === "2" && msg?.result?.stopReason === "end_turn",
+      )
+
+      expect(chunkIndex).toBeGreaterThanOrEqual(0)
+      expect(responseIndex).toBeGreaterThanOrEqual(0)
+      expect(chunkIndex).toBeLessThan(responseIndex)
+    } finally {
+      SessionPrompt.command = originalCommand
+      SessionPrompt.prompt = originalPrompt
     }
   })
 
