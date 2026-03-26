@@ -14,6 +14,8 @@ import { MessageV2 } from "../session/message-v2"
 import { Bus } from "../bus"
 import { ACPProviderMeta } from "./provider-meta"
 import type { SessionID } from "../session/schema"
+import { WorkspaceDiffer } from "./workspace-diff"
+import path from "path"
 
 const PROTOCOL_VERSION = "0.1.0"
 
@@ -234,6 +236,10 @@ export class ACPServer {
           })
         }
 
+        // Workspace diff safety net: snapshot before agent runs
+        const wsDiff = new WorkspaceDiffer()
+        await wsDiff.snapshot(session.workspace)
+
         ACPProviderMeta()[session.id] = providerMeta
 
         const sessionId = session.id
@@ -302,18 +308,53 @@ export class ACPServer {
         })
 
         try {
-          await SessionPrompt.prompt({
+          const result = await SessionPrompt.prompt({
             sessionID: sessionId as SessionID,
             model: { providerID: "reaslab" as any, modelID: (providerMeta.model || "unknown") as any },
             agent: "build",
             parts,
           })
+
+          const errorMessage = result.info.role === "assistant"
+            ? result.info.error?.data?.message || result.info.error?.message
+            : undefined
+
+          if (errorMessage) {
+            this._notify(ACP.response(requestId, { stopReason: "error", error: errorMessage }))
+            return
+          }
         } finally {
           unsubPartUpdated()
           unsubPartDelta()
           unsubSessionError()
           partTypes.clear()
           delete ACPProviderMeta()[session.id]
+
+          // Workspace diff safety net: emit synthetic notifications for any
+          // files changed during the turn (catches MCP tool writes, etc.)
+          if (!session.abortController?.signal.aborted) {
+            const wsDiffs = await wsDiff.computeDiffs(session.workspace).catch((err: any) => {
+              console.error("[workspace-diff] computeDiffs error:", err)
+              return []
+            })
+            let counter = 0
+            for (const diff of wsDiffs) {
+              const relPath = path.relative(session.workspace, diff.absolutePath)
+              const syntheticId = `ws-sync-${Date.now()}-${++counter}-${path.basename(diff.absolutePath)}`
+              this._notify(ACP.toolCall(sessionId, syntheticId, "workspace-sync", { file: relPath }, session.workspace))
+              this._notify(
+                ACP.toolCallUpdate(
+                  sessionId,
+                  syntheticId,
+                  "completed",
+                  "File synced by external tool",
+                  { type: "diff", path: diff.absolutePath, oldText: diff.oldText, newText: diff.newText },
+                  { workspace: session.workspace },
+                  { path: diff.absolutePath },
+                ),
+              )
+            }
+          }
         }
       },
     })
