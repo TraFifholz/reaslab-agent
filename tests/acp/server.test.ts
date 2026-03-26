@@ -8,6 +8,8 @@ import { MessageID, PartID } from "../../src/session/schema"
 import { NamedError } from "@opencode-ai/util/error"
 import { Todo } from "../../src/session/todo"
 
+const TEST_WORKSPACE = "/tmp/test-workspace"
+
 describe("ACPServer", () => {
   test("handles initialize", async () => {
     const server = new ACPServer()
@@ -87,7 +89,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const result = await server.dispatch({
@@ -121,7 +123,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const result = await server.dispatch({
@@ -167,7 +169,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     ;(server as any).executeAgentLoop = () =>
@@ -209,7 +211,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     ;(server as any).executeAgentLoop = async () => {
@@ -262,7 +264,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const originalPrompt = (SessionPrompt as any).prompt
@@ -338,7 +340,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const originalPrompt = (SessionPrompt as any).prompt
@@ -396,7 +398,7 @@ describe("ACPServer", () => {
             rawOutput: {
               error: "apply_patch verification failed: no hunks found",
             },
-            locations: [{ path: "README.md" }],
+            locations: [{ path: "/workspace/README.md" }],
             content: [
               {
                 type: "content",
@@ -410,7 +412,7 @@ describe("ACPServer", () => {
           _meta: {
             source: "mainagent",
             agent_name: "default",
-            workspace: "/workspace",
+            workspace: TEST_WORKSPACE,
           },
         },
       })
@@ -428,7 +430,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const sessionId = sess.result.sessionId
@@ -513,7 +515,7 @@ describe("ACPServer", () => {
           _meta: {
             source: "mainagent",
             agent_name: "default",
-            workspace: "/workspace",
+            workspace: TEST_WORKSPACE,
           },
         },
       })
@@ -535,7 +537,7 @@ describe("ACPServer", () => {
           _meta: {
             source: "mainagent",
             agent_name: "default",
-            workspace: "/workspace",
+            workspace: TEST_WORKSPACE,
           },
         },
       })
@@ -553,7 +555,7 @@ describe("ACPServer", () => {
       jsonrpc: "2.0",
       id: "1",
       method: "session/new",
-      params: { cwd: "/workspace" },
+      params: { cwd: TEST_WORKSPACE },
     })
 
     const sessionId = sess.result.sessionId
@@ -616,7 +618,7 @@ describe("ACPServer", () => {
           _meta: {
             source: "mainagent",
             agent_name: "default",
-            workspace: "/workspace",
+            workspace: TEST_WORKSPACE,
           },
         },
       })

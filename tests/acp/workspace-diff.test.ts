@@ -18,7 +18,7 @@ describe("WorkspaceDiffer skip rules", () => {
     await fs.mkdir(path.join(tmpDir, "node_modules"))
     await fs.writeFile(path.join(tmpDir, "node_modules", "pkg.js"), "module.exports = {}")
     await fs.writeFile(path.join(tmpDir, "index.ts"), "export const x = 1")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     expect((differ as any).entries.has(path.join(tmpDir, "index.ts"))).toBe(true)
@@ -29,7 +29,7 @@ describe("WorkspaceDiffer skip rules", () => {
     const large = "x".repeat(513 * 1024)
     await fs.writeFile(path.join(tmpDir, "large.txt"), large)
     await fs.writeFile(path.join(tmpDir, "small.txt"), "hello")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     expect((differ as any).entries.has(path.join(tmpDir, "small.txt"))).toBe(true)
@@ -39,7 +39,7 @@ describe("WorkspaceDiffer skip rules", () => {
   test("skips binary files (null byte detection)", async () => {
     await fs.writeFile(path.join(tmpDir, "binary.bin"), Buffer.from([0x00, 0x01, 0x02]))
     await fs.writeFile(path.join(tmpDir, "text.txt"), "hello world")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     expect((differ as any).entries.has(path.join(tmpDir, "text.txt"))).toBe(true)
@@ -50,8 +50,10 @@ describe("WorkspaceDiffer skip rules", () => {
     await fs.writeFile(path.join(tmpDir, "real.txt"), "real content")
     try {
       await fs.symlink(path.join(tmpDir, "real.txt"), path.join(tmpDir, "link.txt"))
-    } catch { return }
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    } catch {
+      return
+    }
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     expect((differ as any).entries.has(path.join(tmpDir, "real.txt"))).toBe(true)
@@ -62,7 +64,7 @@ describe("WorkspaceDiffer skip rules", () => {
     await fs.mkdir(path.join(tmpDir, ".git"))
     await fs.writeFile(path.join(tmpDir, ".git", "HEAD"), "ref: refs/heads/main")
     await fs.writeFile(path.join(tmpDir, "tracked.ts"), "export const x = 1")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     expect((differ as any).entries.has(path.join(tmpDir, "tracked.ts"))).toBe(true)
@@ -84,10 +86,9 @@ describe("WorkspaceDiffer diff detection", () => {
   test("detects modified file", async () => {
     const file = path.join(tmpDir, "hello.txt")
     await fs.writeFile(file, "original content")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
-    // Force mtime change
     await new Promise((r) => setTimeout(r, 10))
     await fs.writeFile(file, "modified content")
     const now = new Date()
@@ -101,7 +102,7 @@ describe("WorkspaceDiffer diff detection", () => {
 
   test("detects new file (oldText is empty string)", async () => {
     await fs.writeFile(path.join(tmpDir, "existing.txt"), "exists")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     const newFile = path.join(tmpDir, "new.txt")
@@ -115,7 +116,7 @@ describe("WorkspaceDiffer diff detection", () => {
 
   test("ignores unmodified files", async () => {
     await fs.writeFile(path.join(tmpDir, "same.txt"), "unchanged")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     const diffs = await differ.computeDiffs(tmpDir)
@@ -125,7 +126,7 @@ describe("WorkspaceDiffer diff detection", () => {
   test("ignores deleted files (no error)", async () => {
     const file = path.join(tmpDir, "will-delete.txt")
     await fs.writeFile(file, "gone")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     await fs.rm(file)
@@ -134,7 +135,7 @@ describe("WorkspaceDiffer diff detection", () => {
   })
 
   test("returns [] if snapshot never called", async () => {
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     const diffs = await differ.computeDiffs(tmpDir)
     expect(diffs).toHaveLength(0)
@@ -143,7 +144,7 @@ describe("WorkspaceDiffer diff detection", () => {
   test("returns diffs sorted by path", async () => {
     await fs.writeFile(path.join(tmpDir, "b.txt"), "before")
     await fs.writeFile(path.join(tmpDir, "a.txt"), "before")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
     const now = new Date()
@@ -170,7 +171,7 @@ describe("WorkspaceDiffer error handling", () => {
   })
 
   test("returns [] for non-existent workspace (graceful degradation)", async () => {
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot("/nonexistent/path/that/does/not/exist")
     const diffs = await differ.computeDiffs("/nonexistent/path/that/does/not/exist")
@@ -180,10 +181,9 @@ describe("WorkspaceDiffer error handling", () => {
   test("content-identical file with changed mtime is not reported", async () => {
     const file = path.join(tmpDir, "touched.txt")
     await fs.writeFile(file, "same content")
-    const { WorkspaceDiffer } = await import("../workspace-diff")
+    const { WorkspaceDiffer } = await import("../../src/acp/workspace-diff")
     const differ = new WorkspaceDiffer()
     await differ.snapshot(tmpDir)
-    // Change mtime but keep content identical
     const future = new Date(Date.now() + 5000)
     await fs.utimes(file, future, future)
     const diffs = await differ.computeDiffs(tmpDir)

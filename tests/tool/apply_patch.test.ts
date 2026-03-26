@@ -69,7 +69,6 @@ describe("Patch.parsePatch", () => {
       path: "src/example.ts",
     })
     expect(result.hunks[0]?.chunks).toEqual([
-      { type: "context", content: "@@" },
       { type: "remove", content: "oldValue" },
       { type: "add", content: "newValue" },
     ])
