@@ -206,6 +206,15 @@ describe("ACPServer", () => {
       })
     })
 
+    test("does not recognize non-leading slash text", () => {
+      const server = new ACPServer()
+
+      expect((server as any).resolvePromptInvocation("hello /init")).toEqual({
+        type: "prompt",
+        parts: [{ type: "text", text: "hello /init" }],
+      })
+    })
+
     test("does not recognize plain text as a slash command", () => {
       const server = new ACPServer()
 
