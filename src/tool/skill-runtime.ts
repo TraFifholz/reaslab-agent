@@ -7,6 +7,7 @@ import { Instance } from "@/project/instance"
 import { SessionID } from "@/session/schema"
 import { Skill } from "@/skill"
 import { Flag } from "@/flag/flag"
+import { Glob } from "@/util/glob"
 import { Tool } from "./tool"
 
 const ScopeSchema = z.enum(["workspace", "session"])
@@ -78,7 +79,22 @@ type UnloadParamsInput = z.infer<typeof UnloadParams>
 
 type RuntimeScopeName = z.infer<typeof ScopeSchema>
 type RuntimeScopeArgs = z.infer<typeof RuntimeScopeSchema>
-type ScopedParams = z.infer<typeof WorkspaceScopeParams> | z.infer<typeof SessionScopeParams>
+type WorkspaceScope = z.infer<typeof WorkspaceScopeParams>
+type SessionScope = z.infer<typeof SessionScopeParams>
+type ScopedParams = WorkspaceScope | SessionScope
+type FinderExtras = {
+  query?: string
+  includeHidden?: boolean
+}
+type LoadExtras = {
+  localPath: string
+}
+type UnloadExtras = {
+  name: string
+}
+type NormalizedFinderParams = ScopedParams & FinderExtras
+type NormalizedLoadParams = ScopedParams & LoadExtras
+type NormalizedUnloadParams = ScopedParams & UnloadExtras
 
 type RuntimeToolScope = {
   scope: RuntimeScopeName
@@ -94,7 +110,7 @@ function requireScope(scope: RuntimeScopeName, args: RuntimeScopeArgs) {
   if (!args.workspaceID) {
     throw new Error(`${scope} scope requires workspaceID`)
   }
-  if (scope === "session" && !args.sessionID) {
+  if (scope === "session" && !("sessionID" in args && args.sessionID)) {
     throw new Error("session scope requires sessionID")
   }
 }
@@ -124,65 +140,91 @@ function clearDeniedPath(input: RuntimeToolScope, localPath: string) {
   deniedPaths(input).delete(localPath)
 }
 
-function asSessionScope(input: DefaultSessionScopeInput | z.infer<typeof SessionScopeParams>): z.infer<typeof SessionScopeParams> {
+function hasScope(input: FinderParamsInput | LoadParamsInput | UnloadParamsInput): input is ScopedParams {
+  return "scope" in input && (input.scope === "workspace" || input.scope === "session")
+}
+
+function asSessionScope<T extends DefaultSessionScopeInput | SessionScope>(input: T): T & { scope: "session" } {
   return {
     ...input,
     scope: "session",
   }
 }
 
-function normalizeFinderScope(input: FinderParamsInput): ScopedParams {
-  return input.scope === "session" ? input : { ...input, scope: "workspace" }
+function normalizeFinderScope(input: FinderParamsInput): NormalizedFinderParams {
+  if (hasScope(input)) return input
+  return { ...input, scope: "workspace" }
 }
 
-function normalizeLoadScope(input: LoadParamsInput): ScopedParams {
-  return input.scope === "workspace" ? input : asSessionScope(input)
+function normalizeLoadScope(input: LoadParamsInput): NormalizedLoadParams {
+  if (hasScope(input)) return input
+  return asSessionScope(input)
 }
 
-function normalizeUnloadScope(input: UnloadParamsInput): ScopedParams {
-  return input.scope === "workspace" ? input : asSessionScope(input)
+function normalizeUnloadScope(input: UnloadParamsInput): NormalizedUnloadParams {
+  if (hasScope(input)) return input
+  return asSessionScope(input)
 }
 
 async function ensureRuntimeScope(input: FinderParamsInput | LoadParamsInput | UnloadParamsInput) {
   await ensureDiscovered()
-  return input.scope === "workspace" ? input : input.scope === "session" ? input : null
 }
 
-async function detectSkillConflict(name: string, scope: ScopedParams) {
-  const existingRuntime = await Skill.runtimeGet(name, scopeInput(scope.scope, scope), {
-    includeHidden: true,
+async function detectSkillConflict(name: string, scope: ScopedParams, location?: string) {
+  const discoveredMatches = await Glob.scan("**/SKILL.md", {
+    cwd: Instance.directory,
+    absolute: true,
+    include: "file",
+    symlink: true,
   })
+  const discoveredSkills = await Promise.all(
+    discoveredMatches.map((file) => Skill.parseRuntimeInfo(file, { invalid: "ignore", log: false })),
+  )
+  const conflictingDiscovered = discoveredSkills.find(
+    (skill) => skill?.name === name && skill.location !== location,
+  )
+  if (conflictingDiscovered) return conflictingDiscovered
+
+  const runtimeMatches = (await Skill.runtimeAll(scopeInput(scope), {
+    includeHidden: true,
+  })).filter((skill) => skill.name === name)
+
+  const conflictingRuntime = runtimeMatches.find((skill) => skill.location !== location)
+  if (conflictingRuntime) return conflictingRuntime
+
+  const existingRuntime = runtimeMatches.find((skill) => skill.location === location)
   if (existingRuntime) return existingRuntime
+
   return Skill.get(name)
 }
 
-function scopeInput(scope: RuntimeScopeName, args: RuntimeScopeArgs) {
-  requireScope(scope, args)
+function scopeInput(args: RuntimeScopeArgs) {
+  requireScope(args.scope, args)
   return {
     workspaceID: args.workspaceID,
-    sessionID: scope === "session" ? args.sessionID : undefined,
+    sessionID: args.scope === "session" ? args.sessionID : undefined,
   }
 }
 
-function hiddenRoot(scope: RuntimeScopeName, args: RuntimeScopeArgs) {
-  const workspaceKey = args.workspaceID ? String(args.workspaceID) : "workspace"
-  const sessionKey = args.sessionID ? String(args.sessionID) : "session"
+function hiddenRoot(args: RuntimeScopeArgs) {
+  const workspaceKey = String(args.workspaceID)
+  const sessionKey = args.scope === "session" ? String(args.sessionID) : "session"
   return path.join(
     Instance.directory,
     ".opencode",
     "runtime-skill-hidden",
-    scope,
-    scope === "session" ? `${workspaceKey}-${sessionKey}` : workspaceKey,
+    args.scope,
+    args.scope === "session" ? `${workspaceKey}-${sessionKey}` : workspaceKey,
   )
 }
 
-async function hideSkill(name: string, scope: RuntimeScopeName, args: RuntimeScopeArgs) {
+async function hideSkill(name: string, args: RuntimeScopeArgs) {
   await ensureDiscovered()
   await Skill.runtimeLoad({
-    scope,
-    root: hiddenRoot(scope, args),
+    scope: args.scope,
+    root: hiddenRoot(args),
     hide: [name],
-    ...scopeInput(scope, args),
+    ...scopeInput(args),
   })
 }
 
@@ -198,7 +240,7 @@ async function parseLocalSkill(localPath: string) {
     throw new Error(`Local skill path is inaccessible or missing: ${localPath}`)
   })
 
-  return Skill.parseRuntimeInfo(localPath, {
+  const skill = await Skill.parseRuntimeInfo(localPath, {
     invalid: "throw",
     log: false,
   }).catch((error) => {
@@ -207,10 +249,16 @@ async function parseLocalSkill(localPath: string) {
     }
     throw error
   })
+
+  if (!skill) {
+    throw new Error(`Invalid skill frontmatter in ${localPath}`)
+  }
+
+  return skill
 }
 
-async function listVisibleSkills(args: z.infer<typeof FinderParams>) {
-  const visible = await Skill.runtimeAll(scopeInput(args.scope, args), {
+async function listVisibleSkills(args: NormalizedFinderParams) {
+  const visible = await Skill.runtimeAll(scopeInput(args), {
     includeHidden: args.includeHidden === true,
   })
   const denied = deniedPaths(args)
@@ -248,7 +296,7 @@ export const SkillFinderTool = Tool.define("skill-finder", {
     }
 
     if (params.query && params.includeHidden) {
-      const hidden = await Skill.runtimeGet(params.query, scopeInput(scope, normalized), {
+      const hidden = await Skill.runtimeGet(params.query, scopeInput(normalized), {
         includeHidden: true,
       })
       if (hidden && !denied.has(hidden.location)) {
@@ -311,7 +359,7 @@ export const LoadSkillTool = Tool.define("load-skill", {
       }
     }
 
-    const skillConflict = await detectSkillConflict(skill.name, normalized)
+    const skillConflict = await detectSkillConflict(skill.name, normalized, localPath)
     if (skillConflict && skillConflict.location !== localPath) {
       return {
         title: skill.name,
@@ -344,7 +392,7 @@ export const LoadSkillTool = Tool.define("load-skill", {
       scope,
       root: path.dirname(localPath),
       file: localPath,
-      ...scopeInput(scope, normalized),
+      ...scopeInput(normalized),
     })
     clearDeniedPath(normalized, localPath)
 
@@ -377,7 +425,7 @@ export const UnloadSkillTool = Tool.define("unload-skill", {
       },
     })
 
-    await hideSkill(normalized.name, normalized.scope, normalized)
+    await hideSkill(normalized.name, normalized)
 
     return {
       title: normalized.name,
