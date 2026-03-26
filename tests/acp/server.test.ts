@@ -6,6 +6,7 @@ import { Session } from "../../src/session"
 import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID } from "../../src/session/schema"
 import { NamedError } from "@opencode-ai/util/error"
+import { Todo } from "../../src/session/todo"
 
 describe("ACPServer", () => {
   test("handles initialize", async () => {
@@ -107,8 +108,7 @@ describe("ACPServer", () => {
     // Immediate response is null
     expect(result.result).toBeNull()
 
-    // Wait for async processing
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitFor(() => notifications.length > 0)
 
     // Should have received notifications
     expect(notifications.length).toBeGreaterThan(0)
@@ -379,7 +379,11 @@ describe("ACPServer", () => {
       })
 
       expect(result.result).toBeNull()
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "tool_call_update",
+        ),
+      )
       expect(notifications).toContainEqual({
         jsonrpc: "2.0",
         method: "session/update",
@@ -400,6 +404,212 @@ describe("ACPServer", () => {
                   type: "text",
                   text: "apply_patch verification failed: no hunks found",
                 },
+              },
+            ],
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: "/workspace",
+          },
+        },
+      })
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("emits plan updates when todos change", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "/workspace" },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async () => {
+      await Bus.publish(Todo.Event.Updated, {
+        sessionID: sessionId,
+        todos: [
+          {
+            content: "Implement ACP projection",
+            status: "in_progress",
+            priority: "high",
+          },
+          {
+            content: "Skip obsolete fallback",
+            status: "cancelled",
+            priority: "low",
+          },
+        ],
+      })
+
+      await Bus.publish(Todo.Event.Updated, {
+        sessionID: sessionId,
+        todos: [
+          {
+            content: "Only latest snapshot remains",
+            status: "pending",
+            priority: "medium",
+          },
+        ],
+      })
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.filter(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+        ).length === 2,
+      )
+
+      const planNotifications = notifications.filter(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+      )
+
+      expect(planNotifications).toHaveLength(2)
+      expect(planNotifications[0]).toEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "plan",
+            entries: [
+              {
+                content: "Implement ACP projection",
+                status: "in_progress",
+                priority: "high",
+              },
+              {
+                content: "Skip obsolete fallback",
+                status: "completed",
+                priority: "low",
+              },
+            ],
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: "/workspace",
+          },
+        },
+      })
+      expect(planNotifications[1]).toEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "plan",
+            entries: [
+              {
+                content: "Only latest snapshot remains",
+                status: "pending",
+                priority: "medium",
+              },
+            ],
+          },
+          _meta: {
+            source: "mainagent",
+            agent_name: "default",
+            workspace: "/workspace",
+          },
+        },
+      })
+    } finally {
+      ;(SessionPrompt as any).prompt = originalPrompt
+    }
+  })
+
+  test("emits plan updates when todowrite updates todos", async () => {
+    const server = new ACPServer()
+    const notifications: any[] = []
+    server.onNotification = (msg) => notifications.push(msg)
+
+    const sess = await server.dispatch({
+      jsonrpc: "2.0",
+      id: "1",
+      method: "session/new",
+      params: { cwd: "/workspace" },
+    })
+
+    const sessionId = sess.result.sessionId
+    const originalPrompt = (SessionPrompt as any).prompt
+    ;(SessionPrompt as any).prompt = async (input: { sessionID: string }) => {
+      Todo.update({
+        sessionID: input.sessionID as any,
+        todos: [
+          {
+            content: "Write through todo tool",
+            status: "in_progress",
+            priority: "high",
+          },
+        ],
+      })
+    }
+
+    try {
+      const result = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "2",
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: "Hello!",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://localhost",
+            apiKey: "test-key",
+          },
+        },
+      })
+
+      expect(result.result).toBeNull()
+      await waitFor(() =>
+        notifications.some(
+          (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+        ),
+      )
+
+      const planNotification = notifications.find(
+        (msg) => msg?.method === "session/update" && msg?.params?.update?.sessionUpdate === "plan",
+      )
+
+      expect(planNotification).toEqual({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "plan",
+            entries: [
+              {
+                content: "Write through todo tool",
+                status: "in_progress",
+                priority: "high",
               },
             ],
           },

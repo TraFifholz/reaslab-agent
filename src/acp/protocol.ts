@@ -59,6 +59,12 @@ export namespace ACP {
     [key: string]: unknown
   }
 
+  export interface PlanEntry {
+    content: string
+    priority: "high" | "medium" | "low"
+    status: "pending" | "in_progress" | "completed"
+  }
+
   const DEFAULT_META: UpdateMeta = {
     source: "mainagent",
     agent_name: "default",
@@ -135,6 +141,22 @@ export namespace ACP {
       content: {
         type: "text",
         text,
+      },
+    }
+  }
+
+  /** Create plan update notification */
+  export function planUpdate(sessionId: string, entries: PlanEntry[], meta?: Partial<UpdateMeta>) {
+    return {
+      jsonrpc: "2.0" as const,
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries,
+        },
+        _meta: { ...DEFAULT_META, ...meta },
       },
     }
   }
