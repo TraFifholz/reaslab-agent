@@ -21,10 +21,61 @@ import { Plugin } from "@/plugin"
 import { SystemPrompt } from "./system"
 import { Flag } from "@/flag/flag"
 import { Permission } from "@/permission"
+import { DebugTrace } from "@/util/debug-trace"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
   export const OUTPUT_TOKEN_MAX = 32000
+
+  type RepairableToolCall = {
+    toolName: string
+    input: string
+    [key: string]: unknown
+  }
+
+  export function repairToolCall<T extends RepairableToolCall>(
+    failed: {
+      toolCall: T
+      error: {
+        message: string
+      }
+    },
+    tools: Record<string, Tool>,
+  ): T {
+    const lower = failed.toolCall.toolName.toLowerCase()
+    if (lower !== failed.toolCall.toolName && tools[lower]) {
+      void DebugTrace.write("llm.repair.lowercase", {
+        toolName: failed.toolCall.toolName,
+        repaired: lower,
+        input: failed.toolCall.input,
+      })
+      log.info("repairing tool call", {
+        tool: failed.toolCall.toolName,
+        repaired: lower,
+      })
+      return {
+        ...failed.toolCall,
+        toolName: lower,
+      }
+    }
+    const repaired = {
+      ...failed.toolCall,
+      input: JSON.stringify({
+        tool: failed.toolCall.toolName,
+        error: failed.error.message,
+      }),
+      toolName: "invalid",
+    }
+    void DebugTrace.write("llm.repair.invalid", {
+      toolName: failed.toolCall.toolName,
+      input: failed.toolCall.input,
+      repairedToolName: repaired.toolName,
+      repairedInput: repaired.input,
+      error: failed.error.message,
+      toolKeys: Object.keys(tools),
+    })
+    return repaired
+  }
 
   export type StreamInput = {
     user: MessageV2.User
@@ -148,6 +199,13 @@ export namespace LLM {
 
     const tools = await resolveTools(input)
 
+    void DebugTrace.write("llm.stream.start", {
+      sessionID: input.sessionID,
+      modelID: input.model.id,
+      providerID: input.model.providerID,
+      toolKeys: Object.keys(tools),
+    })
+
     return streamText({
       onError(error) {
         l.error("stream error", {
@@ -155,25 +213,7 @@ export namespace LLM {
         })
       },
       async experimental_repairToolCall(failed) {
-        const lower = failed.toolCall.toolName.toLowerCase()
-        if (lower !== failed.toolCall.toolName && tools[lower]) {
-          l.info("repairing tool call", {
-            tool: failed.toolCall.toolName,
-            repaired: lower,
-          })
-          return {
-            ...failed.toolCall,
-            toolName: lower,
-          }
-        }
-        return {
-          ...failed.toolCall,
-          input: JSON.stringify({
-            tool: failed.toolCall.toolName,
-            error: failed.error.message,
-          }),
-          toolName: "invalid",
-        }
+        return repairToolCall(failed, tools)
       },
       temperature: params.temperature,
       topP: params.topP,
