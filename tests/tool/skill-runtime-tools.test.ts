@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { asSchema } from "ai"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
+import z from "zod"
+import { Agent } from "../../src/agent/agent"
 import { Boot } from "../../src/boot"
 import { Config } from "../../src/config/config"
 import { WorkspaceID } from "../../src/control-plane/schema"
 import { Instance } from "../../src/project/instance"
+import { Provider } from "../../src/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
+import { Session } from "../../src/session"
+import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, SessionID } from "../../src/session/schema"
 import { ToolRegistry } from "../../src/tool/registry"
+import { runtimeSkillHiddenRoot } from "../../src/tool/skill-runtime"
 
 const workspaceID = WorkspaceID.make("wrk_runtime_skill_tools")
 const sessionID = SessionID.make("ses_runtime_skill_tools")
@@ -78,30 +85,19 @@ async function executeRuntimeTool(input: {
     const tool = tools.find((item) => item.id === input.toolID)
     expect(tool, `expected ${input.toolID} to be registered`).toBeDefined()
 
-    const permissionRequests: Record<string, unknown>[] = []
-    const metadataEvents: Array<{ title?: string; metadata?: Record<string, unknown> }> = []
-
     const result = await tool!.execute(input.args, {
       sessionID,
       messageID,
       agent: "build",
       abort: AbortSignal.timeout(30000),
       messages: [],
-      metadata(event) {
-        metadataEvents.push(event as { title?: string; metadata?: Record<string, unknown> })
-      },
+      metadata() {},
       async ask(request) {
-        const next = request as Record<string, unknown>
-        permissionRequests.push(next)
-        await input.ask?.(next)
+        await input.ask?.(request as Record<string, unknown>)
       },
     })
 
-    return {
-      result,
-      permissionRequests,
-      metadataEvents,
-    }
+    return { result }
   })
 }
 
@@ -139,6 +135,86 @@ function expectFound(result: any, name: string) {
   expect(result.output).toContain(name)
 }
 
+function expectExactQueryFound(result: any, name: string) {
+  expect(result.metadata?.status).toBe("ok")
+  expect(result.title).toBe(name)
+}
+
+function expectExplicitObjectSchema(schema: unknown) {
+  expect(schema).toBeDefined()
+  expect(schema).toMatchObject({
+    type: "object",
+  })
+
+  const properties = (schema as { properties?: Record<string, unknown> }).properties
+  expect(properties).toBeDefined()
+  expect(Object.keys(properties ?? {})).not.toHaveLength(0)
+}
+
+function expectSchemaProperties(schema: unknown, keys: string[]) {
+  const properties = (schema as { properties?: Record<string, unknown> }).properties ?? {}
+  for (const key of keys) {
+    expect(properties[key], `expected JSON Schema to include ${key}`).toBeDefined()
+  }
+}
+
+function expectDescriptionShape(
+  description: string | undefined,
+  checks: {
+    maxLength: number
+    requiredWords: string[]
+    oneOfWords?: string[]
+  },
+) {
+  expect(description).toBeString()
+
+  const normalized = description?.trim().toLowerCase() ?? ""
+  expect(normalized.length).toBeGreaterThan(0)
+  expect(normalized.length).toBeLessThanOrEqual(checks.maxLength)
+
+  const words = new Set(normalized.match(/[a-z]+/g) ?? [])
+  for (const word of checks.requiredWords) {
+    expect(words.has(word), `expected description to include word ${word}`).toBe(true)
+  }
+
+  if (checks.oneOfWords) {
+    expect(
+      checks.oneOfWords.some((word) => words.has(word)),
+      `expected description to include one of: ${checks.oneOfWords.join(", ")}`,
+    ).toBe(true)
+  }
+}
+
+function schemaProperty(schema: unknown, key: string) {
+  const properties = (schema as { properties?: Record<string, unknown> }).properties ?? {}
+  return properties[key] as Record<string, unknown> | undefined
+}
+
+async function resolvePromptTools(directory: string) {
+  return withRuntime(directory, async () => {
+    const agent = (await Agent.get("build"))!
+    const model = await Provider.getModel("reaslab", "default")
+    const session = await Session.createNext({
+      directory,
+      workspaceID,
+    })
+
+    return SessionPrompt.resolveTools({
+      agent,
+      model,
+      session,
+      processor: {
+        message: { id: messageID },
+        partFromToolCall() {
+          return undefined
+        },
+      } as any,
+      bypassAgentCheck: false,
+      messages: [],
+    })
+  })
+}
+
 describe("runtime skill tools", () => {
   const tempDirs: string[] = []
 
@@ -150,6 +226,229 @@ describe("runtime skill tools", () => {
   afterEach(async () => {
     await Instance.disposeAll()
     await Promise.all(tempDirs.map((dir) => fs.rm(dir, { recursive: true, force: true })))
+  })
+
+  test("runtime skill tools expose explicit JSON Schema properties", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    const tools = await withRuntime(root, async () =>
+      ToolRegistry.tools({
+        providerID: ProviderID.make("reaslab"),
+        modelID: ModelID.make("default"),
+      }),
+    )
+
+    for (const toolID of ["skill-finder", "load-skill", "unload-skill"] as const) {
+      const tool = tools.find((item) => item.id === toolID)
+      expect(tool, `expected ${toolID} to be registered`).toBeDefined()
+
+      const registrySchema = z.toJSONSchema(tool!.parameters)
+      expectExplicitObjectSchema(registrySchema)
+
+      if (toolID === "skill-finder") {
+        expectSchemaProperties(registrySchema, ["workspaceID"])
+      }
+
+      if (toolID === "load-skill") {
+        expectSchemaProperties(registrySchema, ["workspaceID", "localPath"])
+      }
+
+      if (toolID === "unload-skill") {
+        expectSchemaProperties(registrySchema, ["workspaceID", "name"])
+      }
+    }
+
+    const promptTools = await resolvePromptTools(root)
+
+    for (const toolID of ["skill-finder", "load-skill", "unload-skill"] as const) {
+      const promptTool = promptTools[toolID]
+      expect(promptTool, `expected ${toolID} to resolve for model-facing tools`).toBeDefined()
+
+      const promptSchema = asSchema((promptTool as any).inputSchema).jsonSchema
+      expectExplicitObjectSchema(promptSchema)
+
+      if (toolID === "skill-finder") {
+        expectSchemaProperties(promptSchema, ["workspaceID"])
+      }
+
+      if (toolID === "load-skill") {
+        expectSchemaProperties(promptSchema, ["workspaceID", "localPath"])
+      }
+
+      if (toolID === "unload-skill") {
+        expectSchemaProperties(promptSchema, ["workspaceID", "name"])
+      }
+    }
+  })
+
+  test("runtime skill tools expose short explicit descriptions", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    const tools = await withRuntime(root, async () =>
+      ToolRegistry.tools({
+        providerID: ProviderID.make("reaslab"),
+        modelID: ModelID.make("default"),
+      }),
+    )
+
+    const finder = tools.find((item) => item.id === "skill-finder")
+    const loader = tools.find((item) => item.id === "load-skill")
+    const unloader = tools.find((item) => item.id === "unload-skill")
+
+    expect(finder).toBeDefined()
+    expect(loader).toBeDefined()
+    expect(unloader).toBeDefined()
+
+    expectDescriptionShape(finder?.description, {
+      maxLength: 100,
+      requiredWords: ["runtime", "skills"],
+      oneOfWords: ["session", "workspace"],
+    })
+    expectDescriptionShape(loader?.description, {
+      maxLength: 130,
+      requiredWords: ["runtime", "local", "path"],
+      oneOfWords: ["session", "workspace"],
+    })
+    expectDescriptionShape(unloader?.description, {
+      maxLength: 130,
+      requiredWords: ["runtime", "name"],
+      oneOfWords: ["unload", "hide"],
+    })
+  })
+
+  test("runtime skill tools preserve omitted scope compatibility semantics", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    await writeSkillFile(path.join(root, "skills"), "workspace-default-skill", "workspace default scope skill", "Workspace body")
+    const localPath = await writeSkillFile(root, "session-default-skill", "session default scope skill", "Session body")
+
+    const finderCall = await findSkill(root, {
+      query: "workspace-default-skill",
+      workspaceID,
+    })
+
+    expectExactQueryFound(finderCall.result, "workspace-default-skill")
+    expect(finderCall.result.metadata?.scope).toBe("workspace")
+
+    const loaded = await loadSkill(root, {
+      localPath,
+      workspaceID,
+      sessionID,
+    })
+
+    expect(loaded.result.metadata?.status).toBe("ok")
+    expect(loaded.result.metadata?.scope).toBe("session")
+
+    const visibleBeforeUnload = await findSkill(root, {
+      query: "session-default-skill",
+      scope: "session",
+      workspaceID,
+      sessionID,
+    })
+
+    expectExactQueryFound(visibleBeforeUnload.result, "session-default-skill")
+
+    const unloaded = await unloadSkill(root, {
+      name: "session-default-skill",
+      workspaceID,
+      sessionID,
+    })
+
+    expect(unloaded.result.metadata?.status).toBe("ok")
+    expect(unloaded.result.metadata?.scope).toBe("session")
+
+    const visibleAfterUnload = await findSkill(root, {
+      query: "session-default-skill",
+      scope: "session",
+      workspaceID,
+      sessionID,
+    })
+
+    expectNotFound(visibleAfterUnload.result)
+  })
+
+  test("skill-finder exposes workspaceID and sessionID as plain optional strings in the public schema", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    const tools = await withRuntime(root, async () =>
+      ToolRegistry.tools({
+        providerID: ProviderID.make("reaslab"),
+        modelID: ModelID.make("default"),
+      }),
+    )
+
+    const tool = tools.find((item) => item.id === "skill-finder")
+    expect(tool).toBeDefined()
+
+    const registrySchema = z.toJSONSchema(tool!.parameters)
+    const workspaceID = schemaProperty(registrySchema, "workspaceID")
+    const sessionID = schemaProperty(registrySchema, "sessionID")
+
+    expect(workspaceID).toBeDefined()
+    expect(workspaceID?.type).toBe("string")
+    expect(workspaceID?.pattern).toBeUndefined()
+
+    expect(sessionID).toBeDefined()
+    expect(sessionID?.type).toBe("string")
+    expect(sessionID?.pattern).toBeUndefined()
+  })
+
+  test("load-skill exposes workspaceID and sessionID as plain optional strings in the public schema", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    const tools = await withRuntime(root, async () =>
+      ToolRegistry.tools({
+        providerID: ProviderID.make("reaslab"),
+        modelID: ModelID.make("default"),
+      }),
+    )
+
+    const tool = tools.find((item) => item.id === "load-skill")
+    expect(tool).toBeDefined()
+
+    const registrySchema = z.toJSONSchema(tool!.parameters)
+    const workspaceID = schemaProperty(registrySchema, "workspaceID")
+    const sessionID = schemaProperty(registrySchema, "sessionID")
+
+    expect(workspaceID).toBeDefined()
+    expect(workspaceID?.type).toBe("string")
+    expect(workspaceID?.pattern).toBeUndefined()
+
+    expect(sessionID).toBeDefined()
+    expect(sessionID?.type).toBe("string")
+    expect(sessionID?.pattern).toBeUndefined()
+  })
+
+  test("unload-skill exposes workspaceID and sessionID as plain optional strings in the public schema", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+
+    const tools = await withRuntime(root, async () =>
+      ToolRegistry.tools({
+        providerID: ProviderID.make("reaslab"),
+        modelID: ModelID.make("default"),
+      }),
+    )
+
+    const tool = tools.find((item) => item.id === "unload-skill")
+    expect(tool).toBeDefined()
+
+    const registrySchema = z.toJSONSchema(tool!.parameters)
+    const workspaceID = schemaProperty(registrySchema, "workspaceID")
+    const sessionID = schemaProperty(registrySchema, "sessionID")
+
+    expect(workspaceID).toBeDefined()
+    expect(workspaceID?.type).toBe("string")
+    expect(workspaceID?.pattern).toBeUndefined()
+
+    expect(sessionID).toBeDefined()
+    expect(sessionID?.type).toBe("string")
+    expect(sessionID?.pattern).toBeUndefined()
   })
 
   test("skill-finder returns a discovered skill from the runtime root", async () => {
@@ -545,6 +844,45 @@ describe("runtime skill tools", () => {
     expectFound(workspaceResult.result, "shared-discovered")
   })
 
+  test("runtime skill hidden root uses nested workspace and session directories", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
+    tempDirs.push(root)
+    const customWorkspaceID = WorkspaceID.make("wrk_alpha-beta")
+    const customSessionID = SessionID.make("ses_beta-gamma")
+
+    expect(
+      runtimeSkillHiddenRoot(root, {
+        scope: "session",
+        workspaceID: customWorkspaceID,
+        sessionID: customSessionID,
+      }),
+    ).toBe(
+      path.join(
+        root,
+        ".opencode",
+        "runtime-skill-hidden",
+        "session",
+        String(customWorkspaceID),
+        String(customSessionID),
+      ),
+    )
+
+    expect(
+      runtimeSkillHiddenRoot(root, {
+        scope: "workspace",
+        workspaceID: customWorkspaceID,
+      }),
+    ).toBe(
+      path.join(
+        root,
+        ".opencode",
+        "runtime-skill-hidden",
+        "workspace",
+        String(customWorkspaceID),
+      ),
+    )
+  })
+
   test("unload-skill requests mutation permission before hiding", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
     tempDirs.push(root)
@@ -580,6 +918,7 @@ describe("runtime skill tools", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-tools-"))
     tempDirs.push(root)
     const localPath = await writeSkillFile(root, "workspace-mutation", "workspace runtime skill", "Workspace body")
+    const permissions: string[] = []
 
     const deniedLoad = loadSkill(
       root,
@@ -588,12 +927,19 @@ describe("runtime skill tools", () => {
         scope: "workspace",
         workspaceID,
       },
-      async () => {
-        throw new Error("User denied workspace skill mutation")
+      async (request) => {
+        permissions.push(String(request.permission))
+        if (request.permission === "read") {
+          return
+        }
+        if (request.permission === "skill") {
+          throw new Error("User denied workspace skill mutation")
+        }
       },
     )
 
     await expect(deniedLoad).rejects.toThrow(/user denied workspace skill mutation|permission denied|denied/i)
+    expect(permissions).toEqual(["read", "skill"])
 
     const afterDenied = await findSkill(root, {
       query: "workspace-mutation",

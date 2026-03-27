@@ -3,6 +3,7 @@ import path from "path"
 import z from "zod"
 import { Command } from "@/command"
 import { WorkspaceID } from "@/control-plane/schema"
+import { Identifier } from "@/id/id"
 import { Instance } from "@/project/instance"
 import { SessionID } from "@/session/schema"
 import { Skill } from "@/skill"
@@ -11,6 +12,14 @@ import { Glob } from "@/util/glob"
 import { Tool } from "./tool"
 
 const ScopeSchema = z.enum(["workspace", "session"])
+
+const FinderParams = z.object({
+  scope: ScopeSchema.optional(),
+  workspaceID: z.string(),
+  sessionID: z.string().optional(),
+  query: z.string().optional(),
+  includeHidden: z.boolean().optional(),
+})
 
 const WorkspaceScopeParams = z.object({
   scope: z.literal("workspace"),
@@ -23,65 +32,39 @@ const SessionScopeParams = z.object({
   sessionID: SessionID.zod,
 })
 
-const DefaultWorkspaceScopeParams = z.object({
-  workspaceID: WorkspaceID.zod,
-})
-
-const FinderParams = z.union([
-  WorkspaceScopeParams.extend({
-    query: z.string().optional(),
-    includeHidden: z.boolean().optional(),
-  }),
-  SessionScopeParams.extend({
-    query: z.string().optional(),
-    includeHidden: z.boolean().optional(),
-  }),
-  DefaultWorkspaceScopeParams.extend({
-    query: z.string().optional(),
-    includeHidden: z.boolean().optional(),
-  }),
-])
-
 const DefaultSessionScopeParams = z.object({
   workspaceID: WorkspaceID.zod,
   sessionID: SessionID.zod,
 })
 
-const RuntimeScopeSchema = z.union([WorkspaceScopeParams, SessionScopeParams])
+const LoadParams = z.object({
+  scope: ScopeSchema.optional(),
+  workspaceID: z.string(),
+  sessionID: z.string().optional(),
+  localPath: z.string(),
+})
 
-const LoadParams = z.union([
-  SessionScopeParams.extend({
-    localPath: z.string(),
-  }),
-  WorkspaceScopeParams.extend({
-    localPath: z.string(),
-  }),
-  DefaultSessionScopeParams.extend({
-    localPath: z.string(),
-  }),
-])
-
-const UnloadParams = z.union([
-  SessionScopeParams.extend({
-    name: z.string(),
-  }),
-  WorkspaceScopeParams.extend({
-    name: z.string(),
-  }),
-  DefaultSessionScopeParams.extend({
-    name: z.string(),
-  }),
-])
+const UnloadParams = z.object({
+  scope: ScopeSchema.optional(),
+  workspaceID: z.string(),
+  sessionID: z.string().optional(),
+  name: z.string(),
+})
 
 type FinderParamsInput = z.infer<typeof FinderParams>
 type LoadParamsInput = z.infer<typeof LoadParams>
 type UnloadParamsInput = z.infer<typeof UnloadParams>
 
 type RuntimeScopeName = z.infer<typeof ScopeSchema>
-type RuntimeScopeArgs = z.infer<typeof RuntimeScopeSchema>
 type WorkspaceScope = z.infer<typeof WorkspaceScopeParams>
 type SessionScope = z.infer<typeof SessionScopeParams>
 type ScopedParams = WorkspaceScope | SessionScope
+type RuntimeScopeArgs = ScopedParams
+type RuntimeScopeInput = {
+  scope?: RuntimeScopeName
+  workspaceID: string
+  sessionID?: string
+}
 type FinderExtras = {
   query?: string
   includeHidden?: boolean
@@ -102,18 +85,7 @@ type RuntimeToolScope = {
   sessionID?: z.infer<typeof SessionID.zod>
 }
 
-type DefaultSessionScopeInput = z.infer<typeof DefaultSessionScopeParams>
-
 const deniedPathState = Instance.state(() => new Map<string, Set<string>>())
-
-function requireScope(scope: RuntimeScopeName, args: RuntimeScopeArgs) {
-  if (!args.workspaceID) {
-    throw new Error(`${scope} scope requires workspaceID`)
-  }
-  if (scope === "session" && !("sessionID" in args && args.sessionID)) {
-    throw new Error("session scope requires sessionID")
-  }
-}
 
 function deniedPathKey(input: RuntimeToolScope) {
   return input.scope === "workspace"
@@ -140,34 +112,53 @@ function clearDeniedPath(input: RuntimeToolScope, localPath: string) {
   deniedPaths(input).delete(localPath)
 }
 
-function hasScope(input: FinderParamsInput | LoadParamsInput | UnloadParamsInput): input is ScopedParams {
-  return "scope" in input && (input.scope === "workspace" || input.scope === "session")
-}
-
-function asSessionScope<T extends DefaultSessionScopeInput | SessionScope>(input: T): T & { scope: "session" } {
-  return {
-    ...input,
-    scope: "session",
+function normalizeRuntimeScope(
+  input: RuntimeScopeInput,
+  defaultScope: RuntimeScopeName,
+): RuntimeScopeArgs {
+  const scope = input.scope ?? defaultScope
+  if (!input.workspaceID) {
+    throw new Error(`${scope} scope requires workspaceID`)
   }
+  if (scope === "session" && !input.sessionID) {
+    throw new Error("session scope requires sessionID")
+  }
+
+  return scope === "session"
+    ? {
+        scope,
+        workspaceID: WorkspaceID.make(String(input.workspaceID)),
+        sessionID: SessionID.make(String(input.sessionID)),
+      }
+    : {
+        scope,
+        workspaceID: WorkspaceID.make(String(input.workspaceID)),
+      }
 }
 
 function normalizeFinderScope(input: FinderParamsInput): NormalizedFinderParams {
-  if (hasScope(input)) return input
-  return { ...input, scope: "workspace" }
+  const scope = normalizeRuntimeScope(input, "workspace")
+  return {
+    ...scope,
+    query: input.query,
+    includeHidden: input.includeHidden,
+  }
 }
 
 function normalizeLoadScope(input: LoadParamsInput): NormalizedLoadParams {
-  if (hasScope(input)) return input
-  return asSessionScope(input)
+  const scope = normalizeRuntimeScope(input, "session")
+  return {
+    ...scope,
+    localPath: input.localPath,
+  }
 }
 
 function normalizeUnloadScope(input: UnloadParamsInput): NormalizedUnloadParams {
-  if (hasScope(input)) return input
-  return asSessionScope(input)
-}
-
-async function ensureRuntimeScope(input: FinderParamsInput | LoadParamsInput | UnloadParamsInput) {
-  await ensureDiscovered()
+  const scope = normalizeRuntimeScope(input, "session")
+  return {
+    ...scope,
+    name: input.name,
+  }
 }
 
 async function detectSkillConflict(name: string, scope: ScopedParams, location?: string) {
@@ -199,23 +190,26 @@ async function detectSkillConflict(name: string, scope: ScopedParams, location?:
 }
 
 function scopeInput(args: RuntimeScopeArgs) {
-  requireScope(args.scope, args)
   return {
     workspaceID: args.workspaceID,
     sessionID: args.scope === "session" ? args.sessionID : undefined,
   }
 }
 
-function hiddenRoot(args: RuntimeScopeArgs) {
+export function runtimeSkillHiddenRoot(directory: string, args: RuntimeScopeArgs) {
   const workspaceKey = String(args.workspaceID)
-  const sessionKey = args.scope === "session" ? String(args.sessionID) : "session"
   return path.join(
-    Instance.directory,
+    directory,
     ".opencode",
     "runtime-skill-hidden",
     args.scope,
-    args.scope === "session" ? `${workspaceKey}-${sessionKey}` : workspaceKey,
+    workspaceKey,
+    ...(args.scope === "session" ? [String(args.sessionID)] : []),
   )
+}
+
+function hiddenRoot(args: RuntimeScopeArgs) {
+  return runtimeSkillHiddenRoot(Instance.directory, args)
 }
 
 async function hideSkill(name: string, args: RuntimeScopeArgs) {
@@ -271,10 +265,10 @@ function formatSkillList(skills: Skill.Info[]) {
 }
 
 export const SkillFinderTool = Tool.define("skill-finder", {
-  description: "Find runtime skills available in this workspace or session",
+  description: "Find runtime skills for a workspace or session. Provide sessionID when scope is session.",
   parameters: FinderParams,
   async execute(params) {
-    await ensureRuntimeScope(params)
+    await ensureDiscovered()
     const normalized = normalizeFinderScope(params)
     const scope = normalized.scope
     const visible = await listVisibleSkills(normalized)
@@ -325,10 +319,10 @@ export const SkillFinderTool = Tool.define("skill-finder", {
 })
 
 export const LoadSkillTool = Tool.define("load-skill", {
-  description: "Load a runtime skill into workspace or session scope",
+  description: "Load a runtime skill from a local path into workspace or session scope. Provide sessionID when scope is session.",
   parameters: LoadParams,
   async execute(params, ctx) {
-    await ensureRuntimeScope(params)
+    await ensureDiscovered()
     const normalized = normalizeLoadScope(params)
     const scope = normalized.scope
     const localPath = path.isAbsolute(params.localPath) ? params.localPath : path.resolve(Instance.directory, params.localPath)
@@ -409,10 +403,10 @@ export const LoadSkillTool = Tool.define("load-skill", {
 })
 
 export const UnloadSkillTool = Tool.define("unload-skill", {
-  description: "Hide a runtime skill from workspace or session scope",
+  description: "Unload or hide a runtime skill by name from workspace or session scope. Provide sessionID when scope is session.",
   parameters: UnloadParams,
   async execute(params, ctx) {
-    await ensureRuntimeScope(params)
+    await ensureDiscovered()
     const normalized = normalizeUnloadScope(params)
 
     await ctx.ask({
