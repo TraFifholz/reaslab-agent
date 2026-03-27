@@ -18,15 +18,16 @@ type SessionResult = {
 
 export function createACPHarness() {
   const server = new ACPServer()
-  const notifications: unknown[] = []
-  server.onNotification = (message) => {
-    notifications.push(message)
-  }
 
   return {
     async start({ cwd }: { cwd: string }) {
       const startedAt = Date.now()
+      const notifications: unknown[] = []
       const errors: unknown[] = []
+
+      server.onNotification = (message) => {
+        notifications.push(message)
+      }
 
       const initialize = await server.dispatch({
         jsonrpc: "2.0",

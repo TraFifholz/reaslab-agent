@@ -26,4 +26,20 @@ describe("ACP harness contract", () => {
     expect(result.model).toBeNull()
     expect(result.scenario).toBe("session-bootstrap")
   })
+
+  test("repeated start calls return per-run notifications arrays", async () => {
+    const harness = createACPHarness()
+
+    const first = await harness.start({
+      cwd: "C:/tmp/reaslab-agent/acp-contract-harness",
+    })
+    first.notifications.push({ method: "test/notification" })
+
+    const second = await harness.start({
+      cwd: "C:/tmp/reaslab-agent/acp-contract-harness",
+    })
+
+    expect(second.notifications).toEqual([])
+    expect(second.notifications).not.toBe(first.notifications)
+  })
 })
