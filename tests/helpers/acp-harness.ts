@@ -343,11 +343,13 @@ export function createACPHarness(options?: {
       sessionId,
       prompt,
       _meta,
+      scenario,
       timeoutMs,
     }: {
       sessionId: string
       prompt: string | unknown[]
       _meta: Record<string, unknown>
+      scenario?: string
       timeoutMs: number
     }) {
       const startedAt = Date.now()
@@ -437,7 +439,7 @@ export function createACPHarness(options?: {
           planUpdates: normalized.planUpdates,
           finalResponse: normalized.finalResponse,
           model: typeof _meta.model === "string" ? _meta.model : null,
-          scenario: "prompt-lifecycle",
+          scenario: scenario ?? "prompt-lifecycle",
           timeline: {
             startedAt,
             completedAt: Date.now(),
