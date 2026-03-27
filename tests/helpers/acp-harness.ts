@@ -26,7 +26,7 @@ type JsonRpcResponse = {
   }
 }
 
-type SessionUpdateNotification = {
+type SessionUpdateMessage = {
   method?: string
   params?: {
     update?: {
@@ -46,22 +46,29 @@ type PromptCompletionClassification =
   | "runtime_failure"
   | "model_variance"
 
+type PromptCompletion = {
+  state: PromptCompletionState
+  classification: PromptCompletionClassification | null
+}
+
 function isJsonRpcResponse(message: unknown): message is JsonRpcResponse {
   return !!message && typeof message === "object" && "jsonrpc" in message && ("result" in message || "error" in message)
 }
 
-function isSessionUpdateNotification(message: unknown): message is SessionUpdateNotification {
-  return !!message && typeof message === "object" && "method" in message
+function isSessionUpdateMessage(message: unknown): message is SessionUpdateMessage {
+  return (
+    !!message &&
+    typeof message === "object" &&
+    "method" in message &&
+    message.method === "session/update"
+  )
 }
 
 function classifyCompletion(params: {
   timedOut: boolean
   finalResponse: JsonRpcResponse | null
   errors: unknown[]
-}): {
-  state: PromptCompletionState
-  classification: PromptCompletionClassification
-} {
+}): PromptCompletion {
   if (params.timedOut) {
     return {
       state: "timed_out",
@@ -97,17 +104,37 @@ function classifyCompletion(params: {
     }
   }
 
+  if (stopReason === "end_turn") {
+    return {
+      state: "completed",
+      classification: null,
+    }
+  }
+
   if (params.errors.length > 0) {
     return {
       state: "errored",
-      classification: "model_variance",
+      classification: "runtime_failure",
     }
   }
 
   return {
-    state: "completed",
-    classification: "model_variance",
+    state: "errored",
+    classification: "protocol_mismatch",
   }
+}
+
+function fireAndForgetCancel(server: ACPServer, requestId: string, sessionId: string) {
+  void Promise.resolve()
+    .then(() => server.dispatch({
+      jsonrpc: "2.0",
+      id: `${requestId}-cancel`,
+      method: "session/cancel",
+      params: {
+        sessionId,
+      },
+    }) as Promise<JsonRpcSuccess<{ cancelled: boolean }>>)
+    .catch(() => null)
 }
 
 export function createACPHarness() {
@@ -193,35 +220,41 @@ export function createACPHarness() {
       }) as JsonRpcSuccess<null>
 
       let timedOut = false
-      let cancelResult: JsonRpcSuccess<{ cancelled: boolean }> | null = null
+      let cancelResult: { cancelled: boolean } | null = null
 
       const finalResponse = await new Promise<JsonRpcResponse | null>((resolve) => {
-        const deadline = setTimeout(async () => {
+        let settled = false
+        let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+        const finish = (value: JsonRpcResponse | null) => {
+          if (settled) return
+          settled = true
+          clearTimeout(deadline)
+          if (pollTimer) clearTimeout(pollTimer)
+          resolve(value)
+        }
+
+        const deadline = setTimeout(() => {
           timedOut = true
-          cancelResult = await server.dispatch({
-            jsonrpc: "2.0",
-            id: `${requestId}-cancel`,
-            method: "session/cancel",
-            params: {
-              sessionId,
-            },
-          }) as JsonRpcSuccess<{ cancelled: boolean }>
-          resolve(null)
+          cancelResult = { cancelled: false }
+          fireAndForgetCancel(server, requestId, sessionId)
+          finish(null)
         }, timeoutMs)
 
         const poll = () => {
+          if (settled) return
+
           const response = currentNotifications.find((message) => {
             if (!isJsonRpcResponse(message)) return false
             return message.id === requestId
           }) as JsonRpcResponse | undefined
 
           if (response) {
-            clearTimeout(deadline)
-            resolve(response)
+            finish(response)
             return
           }
 
-          setTimeout(poll, 10)
+          pollTimer = setTimeout(poll, 10)
         }
 
         poll()
@@ -229,7 +262,7 @@ export function createACPHarness() {
 
       const notifications = [...currentNotifications]
       const errors = [...currentErrors]
-      const sessionUpdates = notifications.filter(isSessionUpdateNotification)
+      const sessionUpdates = notifications.filter(isSessionUpdateMessage)
       const textChunks = sessionUpdates.filter(
         (message) => message.params?.update?.sessionUpdate === "agent_message_chunk",
       )
@@ -277,7 +310,7 @@ export function createACPHarness() {
         },
         completion: {
           ...completion,
-          cancelResult: cancelResult?.result ?? null,
+          cancelResult,
         },
       }
     },

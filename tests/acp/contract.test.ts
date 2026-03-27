@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { ACPServer } from "../../src/acp/server"
 import { createACPHarness } from "../helpers/acp-harness"
 
 describe("ACP harness contract", () => {
@@ -92,5 +93,112 @@ describe("ACP harness contract", () => {
     expect(result.finalResponse?.result).toMatchObject({
       stopReason: "error",
     })
+  })
+
+  test("runPrompt times out even if session/cancel never resolves", async () => {
+    const originalDispatch = ACPServer.prototype.dispatch
+
+    ACPServer.prototype.dispatch = function(request) {
+      switch (request.method) {
+        case "initialize":
+          return Promise.resolve({ result: { protocolVersion: "0.1.0" } })
+        case "authenticate":
+          return Promise.resolve({ result: { authenticated: true } })
+        case "session/new":
+          return Promise.resolve({ result: { sessionId: "ses-timeout" } })
+        case "session/prompt":
+          return Promise.resolve({ result: null })
+        case "session/cancel":
+          return new Promise(() => {})
+        default:
+          return Promise.reject(new Error(`Unexpected method: ${request.method}`))
+      }
+    }
+
+    try {
+      const harness = createACPHarness()
+      const started = await harness.start({
+        cwd: "C:/tmp/reaslab-agent/acp-prompt-lifecycle",
+      })
+
+      const result = await Promise.race([
+        harness.runPrompt({
+          sessionId: started.sessionResult.sessionId,
+          prompt: "wait forever",
+          _meta: {
+            model: "test-model",
+            baseUrl: "http://127.0.0.1:1",
+            apiKey: "test-api-key",
+          },
+          timeoutMs: 20,
+        }),
+        new Promise<"hung">((resolve) => {
+          setTimeout(() => resolve("hung"), 250)
+        }),
+      ])
+
+      expect(result).not.toBe("hung")
+      expect(result).toMatchObject({
+        finalResponse: null,
+        completion: {
+          state: "timed_out",
+          classification: "runtime_failure",
+        },
+      })
+    } finally {
+      ACPServer.prototype.dispatch = originalDispatch
+    }
+  })
+
+  test("runPrompt leaves completion classification empty for successful completions", async () => {
+    const originalDispatch = ACPServer.prototype.dispatch
+
+    ACPServer.prototype.dispatch = function(request) {
+      switch (request.method) {
+        case "initialize":
+          return Promise.resolve({ result: { protocolVersion: "0.1.0" } })
+        case "authenticate":
+          return Promise.resolve({ result: { authenticated: true } })
+        case "session/new":
+          return Promise.resolve({ result: { sessionId: "ses-success" } })
+        case "session/prompt":
+          setTimeout(() => {
+            this.onNotification?.({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { stopReason: "end_turn" },
+            })
+          }, 0)
+          return Promise.resolve({ result: null })
+        default:
+          return Promise.reject(new Error(`Unexpected method: ${request.method}`))
+      }
+    }
+
+    try {
+      const harness = createACPHarness()
+      const started = await harness.start({
+        cwd: "C:/tmp/reaslab-agent/acp-prompt-lifecycle",
+      })
+
+      const result = await harness.runPrompt({
+        sessionId: started.sessionResult.sessionId,
+        prompt: "say hello",
+        _meta: {
+          model: "test-model",
+          baseUrl: "http://127.0.0.1:1",
+          apiKey: "test-api-key",
+        },
+        timeoutMs: 100,
+      })
+
+      expect(result.completion.state).toBe("completed")
+      expect(result.completion.classification).toBeNull()
+      expect(result.finalResponse?.result).toMatchObject({
+        stopReason: "end_turn",
+      })
+    } finally {
+      ACPServer.prototype.dispatch = originalDispatch
+    }
   })
 })
