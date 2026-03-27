@@ -144,9 +144,13 @@ function classifyCompletion(params: {
   }
 }
 
-function fireAndForgetCancel(server: ACPServer, requestId: string, sessionId: string) {
+function fireAndForgetCancel(
+  dispatch: (request: DispatchRequest) => Promise<DispatchResult>,
+  requestId: string,
+  sessionId: string,
+) {
   void Promise.resolve()
-    .then(() => server.dispatch({
+    .then(() => dispatch({
       jsonrpc: "2.0",
       id: `${requestId}-cancel`,
       method: "session/cancel",
@@ -296,7 +300,7 @@ export function createACPHarness(options?: {
         const deadline = setTimeout(() => {
           timedOut = true
           cancelResult = { cancelled: false }
-          fireAndForgetCancel(server, requestId, sessionId)
+          fireAndForgetCancel(dispatch, requestId, sessionId)
           finish(null)
         }, timeoutMs)
 

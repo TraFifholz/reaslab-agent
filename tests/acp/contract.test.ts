@@ -135,6 +135,7 @@ describe("ACP harness contract", () => {
 
   test("runPrompt times out even if session/cancel never resolves", async () => {
     const server = new ACPServer()
+    let cancelRequests = 0
     const harness = createACPHarness({
       server,
       dispatch(request) {
@@ -154,6 +155,7 @@ describe("ACP harness contract", () => {
           case "session/prompt":
             return Promise.resolve({ result: null })
           case "session/cancel":
+            cancelRequests += 1
             return new Promise(() => {})
           default:
             return Promise.reject(new Error(`Unexpected method: ${request.method}`))
@@ -189,6 +191,7 @@ describe("ACP harness contract", () => {
         classification: "runtime_failure",
       },
     })
+    expect(cancelRequests).toBe(1)
   })
 
   test("runPrompt leaves completion classification empty for successful completions", async () => {
