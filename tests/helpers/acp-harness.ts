@@ -6,6 +6,15 @@ type JsonRpcSuccess<T> = {
 
 type InitializeResult = {
   protocolVersion: string
+  capabilities: {
+    streaming: boolean
+    tools: boolean
+    skills: boolean
+  }
+  serverInfo: {
+    name: string
+    version: string
+  }
 }
 
 type AuthenticateResult = {
@@ -14,6 +23,14 @@ type AuthenticateResult = {
 
 type SessionResult = {
   sessionId: string
+  workspace: string
+  plan: {
+    entries: Array<{
+      content: string
+      status: "pending" | "in_progress" | "completed"
+      priority: "high" | "medium" | "low"
+    }>
+  }
 }
 
 type JsonRpcResponse = {
@@ -188,6 +205,38 @@ export function createACPHarness() {
         },
         model: null,
         scenario: "session-bootstrap",
+      }
+    },
+
+    async loadSession({
+      sessionId,
+      cwd,
+    }: {
+      sessionId: string
+      cwd: string
+    }) {
+      const startedAt = Date.now()
+      currentNotifications = []
+      currentErrors = []
+
+      const session = await server.dispatch({
+        jsonrpc: "2.0",
+        id: "load-1",
+        method: "session/load",
+        params: {
+          sessionId,
+          cwd,
+        },
+      }) as JsonRpcSuccess<SessionResult>
+
+      return {
+        sessionResult: session.result,
+        notifications: currentNotifications,
+        errors: currentErrors,
+        timeline: {
+          startedAt,
+        },
+        scenario: "session-bootstrap-load",
       }
     },
 
