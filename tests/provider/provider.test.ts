@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach } from "bun:test"
-import { generateText } from "ai"
+import { generateText, streamText } from "ai"
 import { Provider } from "../../src/provider/provider"
 
 describe("Provider.fromMeta", () => {
@@ -107,5 +107,161 @@ describe("Provider.fromMeta", () => {
 
     expect(requestBody.max_completion_tokens).toBe(123)
     expect("max_tokens" in requestBody).toBe(false)
+  })
+
+  test("streams openai-compatible SSE chunks from custom base URLs", async () => {
+    const originalFetch = globalThis.fetch
+    const payload =
+      [
+        `data: ${JSON.stringify({
+          id: "resp_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: "个",
+              },
+              finish_reason: null,
+            },
+          ],
+        })}`,
+        `data: ${JSON.stringify({
+          id: "resp_2",
+          object: "chat.completion.chunk",
+          created: 2,
+          model: "model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: null,
+                reasoning_content: "Evaluating...",
+                tool_calls: null,
+              },
+              finish_reason: null,
+            },
+          ],
+        })}`,
+        `data: ${JSON.stringify({
+          id: "resp_3",
+          object: "chat.completion.chunk",
+          created: 3,
+          model: "model",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                content: "好",
+              },
+              finish_reason: "stop",
+            },
+          ],
+        })}`,
+        "data: [DONE]",
+      ].join("\n\n") + "\n\n"
+
+    globalThis.fetch = async () => {
+      const encoder = new TextEncoder()
+      return new Response(payload, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })
+    }
+
+    try {
+      const model = Provider.fromMeta({
+        model: "model",
+        baseUrl: "https://example.com/v1",
+        apiKey: "sk-test-key",
+      })
+
+      const result = streamText({
+        model,
+        prompt: "Say hello",
+        maxRetries: 0,
+      })
+
+      let text = ""
+      for await (const chunk of result.textStream) {
+        text += chunk
+      }
+
+      expect(text).toBe("个好")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test("normalizes single-newline SSE event streams from compatible gateways", async () => {
+    const originalFetch = globalThis.fetch
+    const payload = [
+      `data: ${JSON.stringify({
+        id: "resp_1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "model",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              content: "个",
+            },
+            finish_reason: null,
+          },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        id: "resp_2",
+        object: "chat.completion.chunk",
+        created: 2,
+        model: "model",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: "好",
+            },
+            finish_reason: "stop",
+          },
+        ],
+      })}`,
+      "data: [DONE]",
+    ].join("\n")
+
+    globalThis.fetch = async () => {
+      return new Response(payload, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })
+    }
+
+    try {
+      const model = Provider.fromMeta({
+        model: "model",
+        baseUrl: "https://example.com/v1",
+        apiKey: "sk-test-key",
+      })
+
+      const result = streamText({
+        model,
+        prompt: "Say hello",
+        maxRetries: 0,
+      })
+
+      let text = ""
+      for await (const chunk of result.textStream) {
+        text += chunk
+      }
+
+      expect(text).toBe("个好")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })

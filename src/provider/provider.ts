@@ -24,6 +24,60 @@ export interface MinimalModel {
 const cache = new Map<string, LanguageModel>()
 
 export namespace Provider {
+  function wrapSSE(res: Response) {
+    if (!res.body) return res
+    if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
+
+    const decoder = new TextDecoder()
+    const encoder = new TextEncoder()
+    const reader = res.body.getReader()
+    let buffer = ""
+    let normalized = false
+
+    const body = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        const part = await reader.read()
+        if (part.done) {
+          if (buffer.length > 0) {
+            ctrl.enqueue(encoder.encode(normalizeSSE(buffer)))
+            buffer = ""
+          }
+          ctrl.close()
+          return
+        }
+
+        buffer += decoder.decode(part.value, { stream: true })
+        const next = normalizeSSE(buffer)
+        if (!next) return
+        normalized = true
+        ctrl.enqueue(encoder.encode(next))
+        buffer = ""
+      },
+      async cancel(reason) {
+        await reader.cancel(reason)
+      },
+    })
+
+    if (!normalized && !buffer) {
+      return new Response(body, {
+        headers: new Headers(res.headers),
+        status: res.status,
+        statusText: res.statusText,
+      })
+    }
+
+    return new Response(body, {
+      headers: new Headers(res.headers),
+      status: res.status,
+      statusText: res.statusText,
+    })
+  }
+
+  function normalizeSSE(input: string) {
+    if (!input.includes("\ndata: ") || input.includes("\n\ndata: ")) return input
+    return input.replace(/\r?\ndata: /g, "\n\ndata: ")
+  }
+
   export type Meta = ProviderMeta
   export type Model = MinimalModel
 
@@ -41,6 +95,10 @@ export namespace Provider {
       name: "reaslab",
       baseURL: meta.baseUrl,
       apiKey: meta.apiKey,
+      fetch: async (input, init) => {
+        const res = await fetch(input, init)
+        return wrapSSE(res)
+      },
     })
 
     const model = provider.chat(meta.model)
