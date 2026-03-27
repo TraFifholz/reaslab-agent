@@ -76,6 +76,29 @@ type PromptCompletion = {
   classification: PromptCompletionClassification | null
 }
 
+type PromptRunResult = ReturnType<ReturnType<typeof createACPHarness>["runPrompt"]> extends Promise<infer TResult>
+  ? TResult
+  : never
+
+type MatrixResultLike = {
+  model: string | null
+  scenario: string
+  completion: PromptRunResult["completion"]
+  aggregatedText: string
+  notifications: unknown[]
+  errors: unknown[]
+}
+
+type MatrixRun = {
+  harness: ReturnType<typeof createACPHarness>
+  started: Awaited<ReturnType<ReturnType<typeof createACPHarness>["start"]>>
+  result: PromptRunResult
+  report: {
+    summary: string
+    result: PromptRunResult
+  }
+}
+
 type PromptRunCapture = {
   sessionId: string
   requestId: string | number | null
@@ -239,6 +262,42 @@ function fireAndForgetCancel(
     .catch(() => null)
 }
 
+function summarizeText(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  if (!normalized) return ""
+  return normalized.length > 60 ? `${normalized.slice(0, 57)}...` : normalized
+}
+
+function formatMatrixResult(result: MatrixResultLike) {
+  const segments = [
+    `model=${result.model ?? "unknown"}`,
+    `scenario=${result.scenario}`,
+    `state=${result.completion.state}`,
+  ]
+
+  if (result.completion.classification) {
+    segments.push(`classification=${result.completion.classification}`)
+  }
+
+  const textPreview = summarizeText(result.aggregatedText)
+  if (textPreview) {
+    segments.push(`text=${JSON.stringify(textPreview)}`)
+  }
+
+  if (result.errors.length > 0) {
+    segments.push(`errors=${result.errors.length}`)
+  }
+
+  if (result.notifications.length > 0) {
+    segments.push(`notifications=${result.notifications.length}`)
+  }
+
+  return {
+    summary: segments.join(" | "),
+    result,
+  }
+}
+
 export function createACPHarness(options?: {
   server?: ACPServer
   dispatch?: (request: DispatchRequest) => Promise<DispatchResult>
@@ -330,6 +389,8 @@ export function createACPHarness(options?: {
   }
 
   return {
+    formatMatrixResult,
+
     async start({ cwd }: { cwd: string }) {
       const startedAt = Date.now()
       const collector = createCollector()
@@ -550,4 +611,60 @@ export function createACPHarness(options?: {
       }
     },
   }
+}
+
+createACPHarness.createIsolatedMatrixRun = async function createIsolatedMatrixRun({
+  cwd,
+  model,
+  scenario,
+  prompt,
+  timeoutMs,
+  promptMeta,
+  createHarness = () => createACPHarness(),
+}: {
+  cwd: string
+  model: string
+  scenario: string
+  prompt: string | unknown[]
+  timeoutMs: number
+  promptMeta: {
+    baseUrl: string
+    apiKey: string
+  }
+  createHarness?: () => ReturnType<typeof createACPHarness>
+}): Promise<MatrixRun> {
+  const harness = createHarness()
+  const started = await harness.start({ cwd })
+  const result = await harness.runPrompt({
+    sessionId: started.sessionResult.sessionId,
+    prompt,
+    _meta: {
+      model,
+      ...promptMeta,
+    },
+    scenario,
+    timeoutMs,
+  })
+
+  return {
+    harness,
+    started,
+    result,
+    report: harness.formatMatrixResult(result),
+  }
+}
+
+export namespace createACPHarness {
+  export let createIsolatedMatrixRun: (params: {
+    cwd: string
+    model: string
+    scenario: string
+    prompt: string | unknown[]
+    timeoutMs: number
+    promptMeta: {
+      baseUrl: string
+      apiKey: string
+    }
+    createHarness?: () => ReturnType<typeof createACPHarness>
+  }) => Promise<MatrixRun>
 }

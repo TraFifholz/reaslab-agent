@@ -129,6 +129,56 @@ describe("ACP model matrix config loader", () => {
 })
 
 describe("ACP model matrix scenario A", () => {
+  test("formats concise per-model output while preserving structured timeout details", () => {
+    const output = createACPHarness().formatMatrixResult({
+      model: "model-timeout",
+      scenario: "basic-prompt-completion",
+      completion: {
+        state: "timed_out",
+        classification: "runtime_failure",
+        cancelResult: {
+          cancelled: false,
+        },
+      },
+      aggregatedText: "",
+      notifications: [],
+      errors: [],
+    })
+
+    expect(output.summary).toContain("model-timeout")
+    expect(output.summary).toContain("basic-prompt-completion")
+    expect(output.summary).toContain("timed_out")
+    expect(output.summary).toContain("runtime_failure")
+    expect(output.result.model).toBe("model-timeout")
+    expect(output.result.scenario).toBe("basic-prompt-completion")
+    expect(output.result.completion).toEqual({
+      state: "timed_out",
+      classification: "runtime_failure",
+      cancelResult: {
+        cancelled: false,
+      },
+    })
+  })
+
+  test("assertion output includes the model name for readable failures", () => {
+    const { summary } = createACPHarness().formatMatrixResult({
+      model: "model-readable",
+      scenario: "basic-prompt-completion",
+      completion: {
+        state: "errored",
+        classification: "runtime_failure",
+        cancelResult: null,
+      },
+      aggregatedText: "",
+      notifications: [],
+      errors: [],
+    })
+
+    expect(() => {
+      expect("completed", `ACP matrix result: ${summary}`).toBe("errored")
+    }).toThrow(/model-readable/)
+  })
+
   test("runPrompt isolates concurrent prompt runs by request", async () => {
     const server = new ACPServer()
     let sessionCounter = 0
@@ -382,26 +432,25 @@ describe("ACP model matrix scenario A", () => {
     }
 
     for (const model of config.models) {
-      const harness = createACPHarness()
       const workspace = await mkdtemp(join(tmpdir(), `acp-model-matrix-${model.replace(/[^a-zA-Z0-9_-]/g, "-")}-`))
       tempDirs.push(workspace)
 
-      const started = await harness.start({ cwd: workspace })
-      const result = await harness.runPrompt({
-        sessionId: started.sessionResult.sessionId,
+      const run = await createACPHarness.createIsolatedMatrixRun({
+        cwd: workspace,
+        model,
+        scenario: "basic-prompt-completion",
         prompt: "Say hello in one word",
-        _meta: {
-          model,
+        timeoutMs: config.timeoutMs,
+        promptMeta: {
           baseUrl: config.baseUrl,
           apiKey: config.apiKey,
         },
-        scenario: "basic-prompt-completion",
-        timeoutMs: config.timeoutMs,
       })
+      const { result, report } = run
 
-      expect(result.scenario).toBe("basic-prompt-completion")
-      expect(result.model).toBe(model)
-      expect(result.completion.state).toBe("completed")
+      expect(result.scenario, report.summary).toBe("basic-prompt-completion")
+      expect(result.model, report.summary).toBe(model)
+      expect(result.completion.state, report.summary).toBe("completed")
 
       const textChunks = result.notifications.filter(
         (message) =>
@@ -417,7 +466,159 @@ describe("ACP model matrix scenario A", () => {
           message.params.update.sessionUpdate === "agent_message_chunk",
       )
 
-      expect(textChunks.length > 0 || result.aggregatedText.length > 0).toBe(true)
+      expect(textChunks.length > 0 || result.aggregatedText.length > 0, report.summary).toBe(true)
     }
   }, 120000)
+
+  test("createIsolatedMatrixRun uses a fresh harness and session per model", async () => {
+    let sessionCounter = 0
+    const harnesses = new Set<ReturnType<typeof createACPHarness>>()
+
+    const firstRun = await createACPHarness.createIsolatedMatrixRun({
+      cwd: "D:/tmp/acp-matrix-model-a",
+      model: "model-a",
+      scenario: "basic-prompt-completion",
+      prompt: "Say hello in one word",
+      timeoutMs: 50,
+      createHarness: () => {
+        const harness = createACPHarness({
+          dispatch: async (request) => {
+            switch (request.method) {
+              case "initialize":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    protocolVersion: "1.0",
+                    capabilities: {
+                      streaming: true,
+                      tools: true,
+                      skills: true,
+                    },
+                    serverInfo: {
+                      name: "test-server",
+                      version: "0.0.0",
+                    },
+                  },
+                }
+              case "authenticate":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    authenticated: true,
+                  },
+                }
+              case "session/new":
+                sessionCounter += 1
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    sessionId: `session-${sessionCounter}`,
+                    workspace: request.params.cwd,
+                    plan: { entries: [] },
+                  },
+                }
+              case "session/prompt":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    stopReason: "end_turn",
+                  },
+                }
+              default:
+                throw new Error(`Unexpected method: ${String(request.method)}`)
+            }
+          },
+        })
+
+        harnesses.add(harness)
+        return harness
+      },
+      promptMeta: {
+        baseUrl: "https://api.example.test/v1",
+        apiKey: "test-api-key",
+      },
+    })
+
+    const secondRun = await createACPHarness.createIsolatedMatrixRun({
+      cwd: "D:/tmp/acp-matrix-model-b",
+      model: "model-b",
+      scenario: "basic-prompt-completion",
+      prompt: "Say hello in one word",
+      timeoutMs: 50,
+      createHarness: () => {
+        const harness = createACPHarness({
+          dispatch: async (request) => {
+            switch (request.method) {
+              case "initialize":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    protocolVersion: "1.0",
+                    capabilities: {
+                      streaming: true,
+                      tools: true,
+                      skills: true,
+                    },
+                    serverInfo: {
+                      name: "test-server",
+                      version: "0.0.0",
+                    },
+                  },
+                }
+              case "authenticate":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    authenticated: true,
+                  },
+                }
+              case "session/new":
+                sessionCounter += 1
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    sessionId: `session-${sessionCounter}`,
+                    workspace: request.params.cwd,
+                    plan: { entries: [] },
+                  },
+                }
+              case "session/prompt":
+                return {
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    stopReason: "end_turn",
+                  },
+                }
+              default:
+                throw new Error(`Unexpected method: ${String(request.method)}`)
+            }
+          },
+        })
+
+        harnesses.add(harness)
+        return harness
+      },
+      promptMeta: {
+        baseUrl: "https://api.example.test/v1",
+        apiKey: "test-api-key",
+      },
+    })
+
+    expect(harnesses.size).toBe(2)
+    expect(firstRun.started.sessionResult.sessionId).toBe("session-1")
+    expect(secondRun.started.sessionResult.sessionId).toBe("session-2")
+    expect(firstRun.started.sessionResult.sessionId).not.toBe(secondRun.started.sessionResult.sessionId)
+    expect(firstRun.result.model).toBe("model-a")
+    expect(firstRun.result.scenario).toBe("basic-prompt-completion")
+    expect(secondRun.result.model).toBe("model-b")
+    expect(secondRun.result.scenario).toBe("basic-prompt-completion")
+  })
 })
