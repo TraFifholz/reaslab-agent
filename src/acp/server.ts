@@ -18,7 +18,6 @@ import { WorkspaceDiffer } from "./workspace-diff"
 import path from "path"
 import { Todo } from "../session/todo"
 import { todoToPlanEntries } from "./plan"
-import { DebugTrace } from "@/util/debug-trace"
 
 const PROTOCOL_VERSION = "0.1.0"
 
@@ -424,12 +423,6 @@ export class ACPServer {
           if (event.properties.sessionID !== sessionId) return
           const message = event.properties.error?.data?.message || "Unknown error"
           sessionErrorMessage = message
-          void DebugTrace.write("acp.session.error", {
-            sessionID: sessionId,
-            message,
-            errorName: event.properties.error?.name,
-            errorData: event.properties.error?.data,
-          })
           this._notify(ACP.messageChunk(sessionId, `\n[Agent error: ${message}]\n`, { workspace: session.workspace }))
         })
 

@@ -16,7 +16,6 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { PartID } from "./schema"
 import type { SessionID, MessageID } from "./schema"
-import { DebugTrace } from "@/util/debug-trace"
 
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
@@ -357,19 +356,7 @@ export namespace SessionProcessor {
               error: e,
               stack: JSON.stringify(e.stack),
             })
-            void DebugTrace.write("session.processor.catch", {
-              sessionID: input.sessionID,
-              errorName: e?.name,
-              errorMessage: e?.message,
-              stack: typeof e?.stack === "string" ? e.stack : undefined,
-            })
             const error = MessageV2.fromError(e, { providerID: input.model.providerID as any })
-            void DebugTrace.write("session.processor.messagev2_error", {
-              sessionID: input.sessionID,
-              errorName: error?.name,
-              errorMessage: error?.data?.message,
-              errorData: error?.data,
-            })
             if (MessageV2.ContextOverflowError.isInstance(error)) {
               needsCompaction = true
               Bus.publish(Session.Event.Error, {

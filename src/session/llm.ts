@@ -13,15 +13,11 @@ import {
 } from "ai"
 import { mergeDeep, pipe } from "remeda"
 import { ProviderTransform } from "@/provider/transform"
-import { Config } from "@/config/config"
-import { Instance } from "@/project/instance"
 import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { SystemPrompt } from "./system"
-import { Flag } from "@/flag/flag"
 import { Permission } from "@/permission"
-import { DebugTrace } from "@/util/debug-trace"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -44,11 +40,6 @@ export namespace LLM {
   ): T {
     const lower = failed.toolCall.toolName.toLowerCase()
     if (lower !== failed.toolCall.toolName && tools[lower]) {
-      void DebugTrace.write("llm.repair.lowercase", {
-        toolName: failed.toolCall.toolName,
-        repaired: lower,
-        input: failed.toolCall.input,
-      })
       log.info("repairing tool call", {
         tool: failed.toolCall.toolName,
         repaired: lower,
@@ -66,14 +57,6 @@ export namespace LLM {
       }),
       toolName: "invalid",
     }
-    void DebugTrace.write("llm.repair.invalid", {
-      toolName: failed.toolCall.toolName,
-      input: failed.toolCall.input,
-      repairedToolName: repaired.toolName,
-      repairedInput: repaired.input,
-      error: failed.error.message,
-      toolKeys: Object.keys(tools),
-    })
     return repaired
   }
 
@@ -109,8 +92,6 @@ export namespace LLM {
       modelID: input.model.id,
       providerID: input.model.providerID,
     })
-    const cfg = Config.get()
-
     // In reaslab-agent, model resolution comes from meta at runtime.
     // Meta can be passed explicitly in StreamInput, or looked up from
     // ACPProviderMeta (populated by ACP server before SessionPrompt.prompt()).
@@ -198,13 +179,6 @@ export namespace LLM {
     const maxOutputTokens = ProviderTransform.maxOutputTokens(input.model)
 
     const tools = await resolveTools(input)
-
-    void DebugTrace.write("llm.stream.start", {
-      sessionID: input.sessionID,
-      modelID: input.model.id,
-      providerID: input.model.providerID,
-      toolKeys: Object.keys(tools),
-    })
 
     return streamText({
       onError(error) {
