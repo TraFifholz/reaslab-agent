@@ -1,5 +1,8 @@
 import { ACPServer } from "../../src/acp/server"
 
+type DispatchRequest = Parameters<ACPServer["dispatch"]>[0]
+type DispatchResult = Awaited<ReturnType<ACPServer["dispatch"]>>
+
 type JsonRpcSuccess<T> = {
   result: T
 }
@@ -154,8 +157,15 @@ function fireAndForgetCancel(server: ACPServer, requestId: string, sessionId: st
     .catch(() => null)
 }
 
-export function createACPHarness() {
-  const server = new ACPServer()
+export function createACPHarness(options?: {
+  server?: ACPServer
+  dispatch?: (request: DispatchRequest) => Promise<DispatchResult>
+}) {
+  const server = options?.server ?? new ACPServer()
+  const dispatch = (request: DispatchRequest) => {
+    if (options?.dispatch) return options.dispatch(request)
+    return server.dispatch(request)
+  }
   let currentNotifications: unknown[] = []
   let currentErrors: unknown[] = []
 
@@ -173,21 +183,21 @@ export function createACPHarness() {
       currentNotifications = []
       currentErrors = []
 
-      const initialize = await server.dispatch({
+      const initialize = await dispatch({
         jsonrpc: "2.0",
         id: "1",
         method: "initialize",
         params: {},
       }) as JsonRpcSuccess<InitializeResult>
 
-      const authenticate = await server.dispatch({
+      const authenticate = await dispatch({
         jsonrpc: "2.0",
         id: "2",
         method: "authenticate",
         params: {},
       }) as JsonRpcSuccess<AuthenticateResult>
 
-      const session = await server.dispatch({
+      const session = await dispatch({
         jsonrpc: "2.0",
         id: "3",
         method: "session/new",
@@ -219,7 +229,7 @@ export function createACPHarness() {
       currentNotifications = []
       currentErrors = []
 
-      const session = await server.dispatch({
+      const session = await dispatch({
         jsonrpc: "2.0",
         id: "load-1",
         method: "session/load",
@@ -257,7 +267,7 @@ export function createACPHarness() {
 
       const requestId = `prompt-${startedAt}`
 
-      const promptImmediateResult = await server.dispatch({
+      const promptImmediateResult = await dispatch({
         jsonrpc: "2.0",
         id: requestId,
         method: "session/prompt",
