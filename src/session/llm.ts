@@ -2,6 +2,7 @@ import { Installation } from "@/installation"
 import { Provider } from "@/provider/provider"
 import { ACPProviderMeta } from "@/acp/provider-meta"
 import { Log } from "@/util/log"
+import { ProviderQuirks } from "@/provider/quirks"
 import {
   streamText,
   type ModelMessage,
@@ -137,15 +138,31 @@ export namespace LLM {
       mergeDeep(input.agent.options),
     )
 
-    const messages = [
-      ...system.map(
-        (x): ModelMessage => ({
-          role: "system",
-          content: x,
-        }),
-      ),
-      ...input.messages,
-    ]
+    // Some providers don't support certain message roles (e.g., 'developer')
+    // Check provider quirks to determine how to send system prompts
+    const useSystemAsUser = ProviderQuirks.requiresSystemAsUser(input.model.providerID)
+
+    const messages = useSystemAsUser
+      ? [
+          ...(system.length > 0
+            ? [
+                {
+                  role: "user" as const,
+                  content: system.join("\n\n"),
+                },
+              ]
+            : []),
+          ...input.messages,
+        ]
+      : [
+          ...system.map(
+            (x): ModelMessage => ({
+              role: "system",
+              content: x,
+            }),
+          ),
+          ...input.messages,
+        ]
 
     const params = await Plugin.trigger(
       "chat.params",
