@@ -552,6 +552,12 @@ export namespace Skill {
       //   await scan(state, dir, OPENCODE_SKILL_PATTERN)
       // }
 
+      // Scan built-in skills directory (packaged in Docker image at /app/skills)
+      const builtinSkillsDir = path.resolve(__dirname, "..", "skills")
+      if (await Filesystem.isDir(builtinSkillsDir)) {
+        await scan(state, builtinSkillsDir, SKILL_PATTERN)
+      }
+
       const cfg = Config.get()
       for (const item of cfg.skills?.paths ?? []) {
         const expanded = item.startsWith("~/") ? path.join(os.homedir(), item.slice(2)) : item
