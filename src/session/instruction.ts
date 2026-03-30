@@ -13,17 +13,14 @@ const log = Log.create({ service: "instruction" })
 
 const FILES = [
   "REASLAB.md",
-  "AGENTS.md",
-  "CLAUDE.md",
-  "CONTEXT.md", // deprecated
 ]
 
 function globalFiles() {
   const files = []
   if (Flag.OPENCODE_CONFIG_DIR) {
-    files.push(path.join(Flag.OPENCODE_CONFIG_DIR, "AGENTS.md"))
+    files.push(path.join(Flag.OPENCODE_CONFIG_DIR, "REASLAB.md"))
   }
-  files.push(path.join(Global.Path.config, "AGENTS.md"))
+  files.push(path.join(Global.Path.config, "REASLAB.md"))
   if (!Flag.OPENCODE_DISABLE_CLAUDE_CODE_PROMPT) {
     files.push(path.join(os.homedir(), ".claude", "CLAUDE.md"))
   }
