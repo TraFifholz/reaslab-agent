@@ -553,7 +553,8 @@ export namespace Skill {
       // }
 
       // Scan built-in skills directory (packaged in Docker image at /app/skills)
-      const builtinSkillsDir = path.resolve(__dirname, "..", "skills")
+      // __dirname is /app/src/skill, so go up two levels to /app
+      const builtinSkillsDir = path.resolve(__dirname, "..", "..", "skills")
       if (await Filesystem.isDir(builtinSkillsDir)) {
         await scan(state, builtinSkillsDir, SKILL_PATTERN)
       }
