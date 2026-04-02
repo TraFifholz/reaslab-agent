@@ -1,6 +1,6 @@
+import fs from "fs"
 import os from "os"
 import path from "path"
-import { pathToFileURL } from "url"
 import z from "zod"
 import { Effect, Layer, ServiceMap } from "effect"
 import { NamedError } from "@opencode-ai/util/error"
@@ -20,6 +20,7 @@ import { ConfigMarkdown } from "../config/markdown"
 import { Glob } from "../util/glob"
 import { Log } from "../util/log"
 import { Discovery } from "./discovery"
+import { ensureSkillsWatcher } from "./refresh"
 
 export namespace Skill {
   const log = Log.create({ service: "skill" })
@@ -27,6 +28,28 @@ export namespace Skill {
   const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md"
   const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md"
   const SKILL_PATTERN = "**/SKILL.md"
+
+  export const DEFAULT_MAX_SKILL_FILE_BYTES = 256_000
+  export const DEFAULT_MAX_SKILLS_IN_PROMPT = 150
+  export const DEFAULT_MAX_SKILLS_PROMPT_CHARS = 30_000
+
+  function getMaxSkillFileBytes(): number {
+    return Config.get().skills?.maxSkillFileBytes ?? DEFAULT_MAX_SKILL_FILE_BYTES
+  }
+
+  function checkFileSize(filePath: string, maxBytes?: number): boolean {
+    const limit = maxBytes ?? getMaxSkillFileBytes()
+    try {
+      const stat = fs.statSync(filePath)
+      if (stat.size > limit) {
+        log.warn("skipping oversized SKILL.md", { path: filePath, size: stat.size, maxBytes: limit })
+        return false
+      }
+      return true
+    } catch {
+      return true // If stat fails, let downstream parsing handle the error
+    }
+  }
 
   export const Info = z.object({
     name: z.string(),
@@ -109,9 +132,32 @@ export namespace Skill {
   type ParsedInfoOptions = {
     invalid?: "throw" | "ignore"
     log?: boolean
+    maxBytes?: number
   }
 
   const runtimeState = Instance.state(() => runtimeOverlay())
+
+  // --- Version tracking for snapshot caching ---
+  const versionState = Instance.state(() => ({ version: 0 }))
+
+  // Module-level reload flag — set by watcher (runs outside Instance context), read by ensure()
+  const needsReloadDirs = new Set<string>()
+
+  export function bumpVersion(): number {
+    const state = versionState()
+    const now = Date.now()
+    state.version = now <= state.version ? state.version + 1 : now
+    return state.version
+  }
+
+  export function getVersion(): number {
+    return versionState().version
+  }
+
+  /** Mark a directory's skills as needing reload; next ensure() will re-scan. */
+  export function markNeedsReload(directory: string): void {
+    needsReloadDirs.add(directory)
+  }
 
   const parseInfo = (location: string, md: { data: unknown; content: string }) => {
     const parsed = Info.pick({ name: true, description: true }).safeParse(md.data)
@@ -134,6 +180,8 @@ export namespace Skill {
   }
 
   const add = async (state: State, match: string) => {
+    if (!checkFileSize(match)) return
+
     const md = await ConfigMarkdown.parse(match).catch(async (err: any) => {
       const message = (ConfigMarkdown as any).FrontmatterError?.isInstance?.(err)
         ? err.data.message
@@ -180,6 +228,16 @@ export namespace Skill {
     const logErrors = opts?.log !== false
     const invalid = opts?.invalid ?? "ignore"
 
+    if (opts?.maxBytes !== undefined && !checkFileSize(location, opts.maxBytes)) {
+      if (invalid === "throw") {
+        throw new InvalidError({
+          path: location,
+          message: `SKILL.md exceeds size limit (${opts.maxBytes} bytes): ${location}`,
+        })
+      }
+      return undefined
+    }
+
     const md = await ConfigMarkdown.parse(location).catch((err) => {
       if (logErrors) {
         log.error("failed to load runtime skill", { skill: location, err })
@@ -222,7 +280,11 @@ export namespace Skill {
           symlink: true,
         })
 
-    const loaded = await Promise.all(matches.map((match) => parseRuntimeInfo(match)))
+    const loaded = await Promise.all(
+      matches
+        .filter((match) => checkFileSize(match))
+        .map((match) => parseRuntimeInfo(match)),
+    )
     const skills = new Map<string, Info>()
     for (const skill of loaded) {
       if (!skill) continue
@@ -508,11 +570,13 @@ export namespace Skill {
   }
 
   export async function runtimeLoad(input: RuntimeLoadInput) {
-    return runtimeState().load(input)
+    await runtimeState().load(input)
+    bumpVersion()
   }
 
   export async function runtimeUnload(input: RuntimeUnloadInput) {
-    return runtimeState().unload(input)
+    await runtimeState().unload(input)
+    bumpVersion()
   }
 
   export async function runtimeAll(scope?: RuntimeScope, opts?: { includeHidden?: boolean }) {
@@ -576,14 +640,34 @@ export namespace Skill {
       }
 
       log.info("init", { count: Object.keys(state.skills).length })
+
+      // Start file watcher for hot-reload
+      ensureSkillsWatcher({
+        directory,
+        worktree,
+        config: cfg.skills,
+      })
     }
 
     const ensure = () => {
-      if (state.task) return state.task
-      state.task = load().catch((err) => {
+      // If watcher flagged a reload, clear cached task to force re-scan
+      if (needsReloadDirs.has(directory) && state.task) {
+        needsReloadDirs.delete(directory)
         state.task = undefined
-        throw err
-      })
+        // Clear in-place (not reassign) because Cache holds references from spread
+        for (const key of Object.keys(state.skills)) delete state.skills[key]
+        state.dirs.clear()
+      }
+
+      if (state.task) return state.task
+      state.task = load()
+        .then(() => {
+          bumpVersion()
+        })
+        .catch((err) => {
+          state.task = undefined
+          throw err
+        })
       return state.task
     }
 
@@ -634,6 +718,21 @@ export namespace Skill {
 
   export const defaultLayer: Layer.Layer<Service> = layer.pipe(Layer.provide(Discovery.defaultLayer))
 
+  export function compactPath(location: string): string {
+    const home = os.homedir()
+    const prefix = home.endsWith(path.sep) ? home : home + path.sep
+    return location.startsWith(prefix) ? "~/" + location.slice(prefix.length) : location
+  }
+
+  function escapeXml(str: string): string {
+    return str
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;")
+  }
+
   export function fmt(list: Info[], opts: { verbose: boolean }) {
     if (list.length === 0) return "No skills are currently available."
 
@@ -642,9 +741,9 @@ export namespace Skill {
         "<available_skills>",
         ...list.flatMap((skill) => [
           "  <skill>",
-          `    <name>${skill.name}</name>`,
-          `    <description>${skill.description}</description>`,
-          `    <location>${pathToFileURL(skill.location).href}</location>`,
+          `    <name>${escapeXml(skill.name)}</name>`,
+          `    <description>${escapeXml(skill.description)}</description>`,
+          `    <location>${escapeXml(compactPath(skill.location))}</location>`,
           "  </skill>",
         ]),
         "</available_skills>",
@@ -652,6 +751,74 @@ export namespace Skill {
     }
 
     return ["## Available Skills", ...list.map((skill) => `- **${skill.name}**: ${skill.description}`)].join("\n")
+  }
+
+  export function fmtCompact(list: Info[]): string {
+    if (list.length === 0) return ""
+    return [
+      "<available_skills>",
+      ...list.flatMap((skill) => [
+        "  <skill>",
+        `    <name>${escapeXml(skill.name)}</name>`,
+        `    <location>${escapeXml(compactPath(skill.location))}</location>`,
+        "  </skill>",
+      ]),
+      "</available_skills>",
+    ].join("\n")
+  }
+
+  export type FmtBudgetResult = {
+    text: string
+    truncated: boolean
+    compact: boolean
+  }
+
+  export function fmtWithBudget(
+    list: Info[],
+    limits: { maxSkillsInPrompt: number; maxSkillsPromptChars: number },
+  ): FmtBudgetResult {
+    if (list.length === 0) {
+      return { text: "No skills are currently available.", truncated: false, compact: false }
+    }
+
+    const total = list.length
+    // Tier 1: trim by count limit
+    const byCount = list.slice(0, Math.max(0, limits.maxSkillsInPrompt))
+    let truncated = total > byCount.length
+
+    // Try full format first
+    const fullText = fmt(byCount, { verbose: true })
+    if (fullText.length <= limits.maxSkillsPromptChars) {
+      return { text: fullText, truncated, compact: false }
+    }
+
+    // Tier 2: try compact format (no descriptions)
+    const compactText = fmtCompact(byCount)
+    if (compactText.length <= limits.maxSkillsPromptChars) {
+      return { text: compactText, truncated, compact: true }
+    }
+
+    // Tier 3: binary search on compact format
+    let lo = 0
+    let hi = byCount.length
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2)
+      if (fmtCompact(byCount.slice(0, mid)).length <= limits.maxSkillsPromptChars) {
+        lo = mid
+      } else {
+        hi = mid - 1
+      }
+    }
+
+    const truncatedList = byCount.slice(0, lo)
+    const truncatedText = fmtCompact(truncatedList)
+    const warning = `Skills truncated: included ${truncatedList.length} of ${total} (compact format, descriptions omitted).`
+
+    return {
+      text: warning + "\n" + truncatedText,
+      truncated: true,
+      compact: true,
+    }
   }
 
   const runPromise = makeRunPromise(Service, defaultLayer)

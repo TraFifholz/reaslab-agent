@@ -1,3 +1,4 @@
+import { Config } from "@/config/config"
 import { Ripgrep } from "../file/ripgrep"
 
 import { Instance } from "../project/instance"
@@ -20,6 +21,14 @@ export namespace SystemPrompt {
   export type Scope = {
     workspaceID?: WorkspaceID
     sessionID?: SessionID
+  }
+
+  // --- Snapshot cache: keyed by "workspaceID:sessionID" ---
+  type CachedSnapshot = { prompt: string; version: number }
+  const snapshotCache = Instance.state(() => new Map<string, CachedSnapshot>())
+
+  function snapshotCacheKey(scope?: Scope): string {
+    return `${scope?.workspaceID ?? ""}:${scope?.sessionID ?? ""}`
   }
 
   export function provider(model: Provider.Model) {
@@ -62,6 +71,17 @@ export namespace SystemPrompt {
   export async function skills(agent: Agent.Info, scope?: Scope) {
     if (Permission.disabled(["skill"], agent.permission).has("skill")) return
 
+    // Check snapshot cache
+    const cacheKey = snapshotCacheKey(scope)
+    const currentVersion = Skill.getVersion()
+    const cache = snapshotCache()
+    const cached = cache.get(cacheKey)
+
+    if (cached && cached.version >= currentVersion && currentVersion > 0) {
+      return cached.prompt
+    }
+
+    // Rebuild
     const base = await Skill.available(agent)
     const runtime = await Skill.runtimeAll(scope)
     const merged = new Map(base.map((skill) => [skill.name, skill] as const))
@@ -71,12 +91,22 @@ export namespace SystemPrompt {
     }
     const list = Array.from(merged.values()).toSorted((a, b) => a.name.localeCompare(b.name))
 
-    return [
+    const cfg = Config.get().skills
+    const limits = {
+      maxSkillsInPrompt: cfg?.maxSkillsInPrompt ?? Skill.DEFAULT_MAX_SKILLS_IN_PROMPT,
+      maxSkillsPromptChars: cfg?.maxSkillsPromptChars ?? Skill.DEFAULT_MAX_SKILLS_PROMPT_CHARS,
+    }
+    const result = Skill.fmtWithBudget(list, limits)
+
+    const prompt = [
       "Skills provide specialized instructions and workflows for specific tasks.",
       "Use the skill tool to load a skill when a task matches its description.",
-      // the agents seem to ingest the information about skills a bit better if we present a more verbose
-      // version of them here and a less verbose version in tool description, rather than vice versa.
-      Skill.fmt(list, { verbose: true }),
+      result.text,
     ].join("\n")
+
+    // Cache the result
+    cache.set(cacheKey, { prompt, version: Skill.getVersion() })
+
+    return prompt
   }
 }

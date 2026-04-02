@@ -1,3 +1,4 @@
+.claude
 node_modules
 dist
 *.log
@@ -9,3 +10,4 @@ migration/
 docs/
 test/
 tests/local/acp-model-test.config.json
+tmp

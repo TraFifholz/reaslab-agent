@@ -12,6 +12,16 @@ export namespace Config {
   export interface SkillsConfig {
     paths?: string[]
     urls?: string[]
+    /** Maximum file size in bytes for a single SKILL.md (default: 256_000) */
+    maxSkillFileBytes?: number
+    /** Maximum number of skills included in the system prompt (default: 150) */
+    maxSkillsInPrompt?: number
+    /** Maximum total characters for the skills section in the system prompt (default: 30_000) */
+    maxSkillsPromptChars?: number
+    /** Enable file watching for SKILL.md hot-reload (default: true) */
+    watch?: boolean
+    /** Debounce interval in ms for file watch events (default: 250) */
+    watchDebounceMs?: number
   }
 
   export interface AppConfig {
