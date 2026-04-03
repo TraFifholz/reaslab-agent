@@ -7,7 +7,6 @@ dist
 data/
 migration/
 .worktrees/
-docs/
 test/
 tests/local/acp-model-test.config.json
 tmp
