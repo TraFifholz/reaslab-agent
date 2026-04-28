@@ -435,8 +435,30 @@ export class ACPServer {
             case "reasoning":
               break
             case "tool": {
+              // Build subagent meta for task (sub-agent dispatch) tool calls
+              const taskSubMeta =
+                part.tool === "task"
+                  ? (() => {
+                      // For completed/error, prefer agent name from registry; fall back to tool input
+                      const childEntry = [...childSessionRegistry.entries()].find(
+                        ([, info]) => info.parentSessionID === sessionId && info.toolCallId === part.callID,
+                      )
+                      const agentType = childEntry
+                        ? childEntry[1].agentName
+                        : ((part.state.input?.subagent_type as string) ?? "task")
+                      return {
+                        source: "subagent",
+                        agent_type: agentType,
+                        instance_name: agentType,
+                        instance_id: part.callID,
+                        tool_call_id: part.callID,
+                        workspace: session.workspace,
+                      }
+                    })()
+                  : undefined
+
               if (part.state.status === "running") {
-                this._notify(ACP.toolCall(sessionId, part.callID, part.tool, (part.state.input ?? {}) as Record<string, unknown>, session.workspace))
+                this._notify(ACP.toolCall(sessionId, part.callID, part.tool, (part.state.input ?? {}) as Record<string, unknown>, session.workspace, taskSubMeta))
               } else if (part.state.status === "completed") {
                 const { output: rawOutput, diff, structured: encodedStructured } = decodeToolOutput(part.state.output)
                 const structured = encodedStructured ?? projectStructuredToolPayload(part.tool, part.state.metadata)
@@ -448,7 +470,7 @@ export class ACPServer {
                     "completed",
                     rawOutput,
                     diff,
-                    { workspace: session.workspace },
+                    taskSubMeta ?? { workspace: session.workspace },
                     {
                       path: (part.state.input?.filePath ?? part.state.input?.path ?? part.state.input?.file ?? "") as string,
                     },
@@ -463,7 +485,7 @@ export class ACPServer {
                     "failed",
                     { error: part.state.error },
                     undefined,
-                    { workspace: session.workspace },
+                    taskSubMeta ?? { workspace: session.workspace },
                     {
                       path: (part.state.input?.filePath ?? part.state.input?.path ?? part.state.input?.file ?? "") as string,
                     },
