@@ -1099,8 +1099,16 @@ export namespace SessionPrompt {
               log.info("file", { mime: part.mime })
               // have to normalize, symbol search returns absolute paths
               // Decode the pathname since URL constructor doesn't automatically decode it
-              const filepath = fileURLToPath(part.url)
-              const s = Filesystem.stat(filepath)
+              let filepath = fileURLToPath(part.url)
+              let s = Filesystem.stat(filepath)
+              if (!s) {
+                // Frontend may send relative paths as file:// URIs (e.g. file://main.tex).
+                // fileURLToPath misresolves them to absolute paths like /main.tex.
+                // Strip leading separator and resolve relative to workspace root.
+                const rel = filepath.replace(/^[/\\]/, "")
+                filepath = path.resolve(Instance.worktree, rel)
+                s = Filesystem.stat(filepath)
+              }
 
               if (s?.isDirectory()) {
                 part.mime = "application/x-directory"

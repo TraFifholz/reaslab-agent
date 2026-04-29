@@ -59,6 +59,12 @@ export function projectStructuredToolPayload(toolId: string, metadata: unknown):
       if (record.resumable && typeof record.resumable === "object") structured.resumable = record.resumable
       return Object.keys(structured).length > 0 ? structured : undefined
     }
+    case "skill": {
+      const structured: Record<string, unknown> = {}
+      if (typeof record.name === "string") structured.name = record.name
+      if (typeof record.dir === "string") structured.dir = record.dir
+      return Object.keys(structured).length > 0 ? structured : undefined
+    }
     default:
       return undefined
   }

@@ -261,6 +261,7 @@ export namespace ACP {
       case "websearch": return (rawInput.query as string) || "websearch"
       case "codesearch": return pattern || "codesearch"
       case "apply_patch": return filePath || "apply_patch"
+      case "skill": return rawInput.name ? `skill: ${rawInput.name}` : "skill"
       default: return toolName
     }
   }
